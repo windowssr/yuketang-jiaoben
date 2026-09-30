@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.0.6
+// @version      3.1.6
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -32,7 +32,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.4',     // 版本号
+    version: '3.1.6',     // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -211,10 +211,18 @@
       const conf = {
         url: saved.url ?? "https://api.deepseek.com/chat/completions",
         key: saved.key ?? "sk-xxxxxxx",
-        model: saved.model ?? "deepseek-chat",
+        model: saved.model ?? "deepseek-flash",
         apiFormat: saved.apiFormat ?? "openai", // openai 或 anthropic
         authMethod: saved.authMethod ?? "bearer", // bearer 或 x-api-key
       };
+      const retiredModels = {
+        'deepseek-chat': 'deepseek-flash',
+        'deepseek-reasoner': 'deepseek-flash',
+        'deepseek-v4-flash': 'deepseek-flash'
+      };
+      if (String(conf.url).includes('deepseek.com') && retiredModels[conf.model]) {
+        conf.model = retiredModels[conf.model];
+      }
       localStorage.setItem(Config.storageKeys.ai, JSON.stringify(conf));
       return conf;
     },
@@ -496,6 +504,10 @@
                 background-color: #1677ff;
                 color: white;
               }
+              #test_settings {
+                background-color: #13c2c2;
+                color: white;
+              }
               #close_settings {
                 background-color: #999;
                 color: white;
@@ -534,7 +546,7 @@
                 </div>
                 <div class="form-item">
                   <label>Model Name:</label>
-                  <input type="text" id="ai_model" placeholder="deepseek-chat">
+                  <input type="text" id="ai_model" placeholder="deepseek-flash">
                 </div>
                 <div class="form-item">
                   <label>API Format:</label>
@@ -563,9 +575,11 @@
                   </label>
                 </div>
                 <div class="settings-footer">
+                  <button id="test_settings">测试连接</button>
                   <button id="save_settings">保存并关闭</button>
                   <button id="close_settings">取消</button>
                 </div>
+                <div id="ai_test_result" style="font-size:12px;margin-top:8px;text-align:center;min-height:18px;"></div>
               </div>
               <div class="footer">
                 <button id="btn-setting">AI配置</button>
@@ -591,6 +605,8 @@
       btnReload: doc.getElementById('btn-reload'),
       settings: doc.getElementById('settings'),
       saveSettings: doc.getElementById('save_settings'),
+      testSettings: doc.getElementById('test_settings'),
+      aiTestResult: doc.getElementById('ai_test_result'),
       closeSettings: doc.getElementById('close_settings'),
       aiUrlInput: doc.getElementById('ai_url'),
       aiKeyInput: doc.getElementById('ai_key'),
@@ -685,7 +701,7 @@
       if (ui.info.lastElementChild) ui.info.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'end', inline: 'nearest' });
     };
 
-    const defaultAI = { url: 'https://api.deepseek.com/chat/completions', key: 'sk-xxxxxxx', model: 'deepseek-chat', apiFormat: 'openai', authMethod: 'bearer' };
+    const defaultAI = { url: 'https://api.deepseek.com/chat/completions', key: 'sk-xxxxxxx', model: 'deepseek-flash', apiFormat: 'openai', authMethod: 'bearer' };
     const loadAIConf = () => {
       const saved = Store.getAIConf();
       ui.aiUrlInput.value = saved.url || defaultAI.url;
@@ -709,14 +725,30 @@
     ui.closeSettings.onclick = () => {
       ui.settings.style.display = 'none';
     };
+    const readFormAIConf = () => ({
+      url: ui.aiUrlInput.value.trim(),
+      key: ui.aiKeyInput.value.trim(),
+      model: ui.aiModelInput.value.trim(),
+      apiFormat: ui.aiFormatSelect.value,
+      authMethod: ui.authMethodSelect.value
+    });
+    ui.testSettings.onclick = async () => {
+      const conf = readFormAIConf();
+      ui.aiTestResult.innerText = '正在测试...';
+      ui.testSettings.disabled = true;
+      try {
+        const reply = await Solver.ping(conf);
+        ui.aiTestResult.innerText = `连接成功：${String(reply || '').replace(/\s+/g, ' ').trim().slice(0, 40)}`;
+        log('✅ AI 连接测试成功');
+      } catch (err) {
+        ui.aiTestResult.innerText = String(err);
+        log(`AI 连接测试失败：${err}`);
+      } finally {
+        ui.testSettings.disabled = false;
+      }
+    };
     ui.saveSettings.onclick = () => {
-      const conf = {
-        url: ui.aiUrlInput.value.trim(),
-        key: ui.aiKeyInput.value.trim(),
-        model: ui.aiModelInput.value.trim(),
-        apiFormat: ui.aiFormatSelect.value,
-        authMethod: ui.authMethodSelect.value
-      };
+      const conf = readFormAIConf();
       Store.setAIConf(conf);
       const featureConf = {
         autoAI: ui.featureAutoAI.checked,
@@ -1211,6 +1243,127 @@
 
   // ---- OCR & AI ----
   const Solver = {
+    readQuestion(element) {
+      if (!element) return '';
+      return String(element.innerText || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    },
+    async captureQuestion(element) {
+      const text = this.readQuestion(element);
+      if (text.replace(/\s/g, '').length > 8) {
+        panel.log('已从页面读取题目');
+        return text;
+      }
+      panel.log('页面文字不足，改用 OCR');
+      return this.recognize(element);
+    },
+    normalizeConf(conf) {
+      const next = { ...conf };
+      let url = String(next.url || '').trim();
+      if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+      const retiredModels = {
+        'deepseek-chat': 'deepseek-flash',
+        'deepseek-reasoner': 'deepseek-flash',
+        'deepseek-v4-flash': 'deepseek-flash'
+      };
+      if (url.includes('deepseek.com') && retiredModels[next.model]) next.model = retiredModels[next.model];
+      if (url.includes('deepseek.com') && (next.apiFormat || 'openai') !== 'anthropic') {
+        try {
+          const parsed = new URL(url);
+          const path = parsed.pathname.replace(/\/+$/, '');
+          if (parsed.hostname === 'api.deepseek.com' && (path === '' || path === '/v1')) {
+            parsed.pathname = '/chat/completions';
+            parsed.search = '';
+            parsed.hash = '';
+            url = parsed.toString();
+          }
+        } catch (_) {}
+      }
+      next.url = url;
+      return next;
+    },
+    requestChat(prompt, systemPrompt, confOverride = null, maxTokens = 1024) {
+      const saved = this.normalizeConf(confOverride || Store.getAIConf());
+      const API_URL = saved.url;
+      const API_KEY = saved.key;
+      const MODEL_NAME = saved.model;
+      const API_FORMAT = saved.apiFormat || 'openai';
+      const AUTH_METHOD = saved.authMethod || 'bearer';
+      return new Promise((resolve, reject) => {
+        if (!API_URL) {
+          reject('请填写 API URL');
+          return;
+        }
+        if (!API_KEY || API_KEY.includes('sk-xxxx')) {
+          const msg = '⚠️ 请在 [AI配置] 中填写有效的 API Key';
+          panel.log(msg);
+          reject(msg);
+          return;
+        }
+        const authHeader = AUTH_METHOD === 'x-api-key'
+          ? { 'x-api-key': API_KEY }
+          : { 'Authorization': `Bearer ${API_KEY}` };
+        const headers = { 'Content-Type': 'application/json', ...authHeader };
+        let body;
+        if (API_FORMAT === 'anthropic') {
+          if (API_URL.includes('api.anthropic.com')) headers['anthropic-version'] = '2023-06-01';
+          body = {
+            model: MODEL_NAME,
+            max_tokens: maxTokens,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: prompt }]
+          };
+        } else {
+          body = {
+            model: MODEL_NAME,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: prompt }
+            ],
+            temperature: 0.1,
+            max_tokens: maxTokens
+          };
+          if (String(API_URL).includes('deepseek.com')) body.thinking = { type: 'disabled' };
+        }
+        GM_xmlhttpRequest({
+          method: 'POST',
+          url: API_URL,
+          headers,
+          data: JSON.stringify(body),
+          timeout: 120000,
+          onload: res => {
+            if (res.status !== 200) {
+              const bodyText = String(res.responseText || (typeof res.response === 'string' ? res.response : '') || '').trim();
+              const err = (res.status === 404 && !bodyText)
+                ? '请求被篡改猴拦截，没有发到 DeepSeek。请确认脚本最上面有 // @connect api.deepseek.com，保存后在篡改猴里允许这个域名。API URL 填 https://api.deepseek.com/chat/completions'
+                : `请求失败: HTTP ${res.status} - ${bodyText.slice(0, 180)}`;
+              panel.log(err);
+              reject(err);
+              return;
+            }
+            try {
+              const json = JSON.parse(res.responseText);
+              const message = json.choices?.[0]?.message;
+              const answerText = json.content?.[0]?.text
+                || message?.content
+                || message?.reasoning_content
+                || '';
+              if (!String(answerText).trim()) {
+                reject('接口已连通，但没有返回文本');
+                return;
+              }
+              resolve(answerText);
+            } catch (_) {
+              reject('JSON 解析失败');
+            }
+          },
+          onerror: () => reject('网络错误'),
+          ontimeout: () => reject('请求超时')
+        });
+      });
+    },
+    ping(conf) {
+      return this.requestChat('只回复两个字：成功', '你是连接测试助手，只按用户要求回复。', conf, 64);
+    },
     async recognize(element) {
       if (!element) return '无元素';
       try {
@@ -1236,134 +1389,19 @@
         return 'OCR识别出错';
       }
     },
-    async askAI(ocrText, optionCount = 0) {
-      const saved = Store.getAIConf();
-      const API_URL = saved.url;
-      const API_KEY = saved.key;
-      const MODEL_NAME = saved.model;
-      const API_FORMAT = saved.apiFormat || 'openai';
-      const AUTH_METHOD = saved.authMethod || 'bearer';
-      return new Promise((resolve, reject) => {
-        if (!API_KEY || API_KEY.includes('sk-xxxx')) {
-          const msg = '⚠️ 请在 [AI配置] 中填写有效的 API Key';
-          panel.log(msg);
-          reject(msg);
-          return;
-        }
-        const maxChar = String.fromCharCode(65 + optionCount - 1);
-        const rangeStr = optionCount ? `A-${maxChar}` : 'A-D';
-        const prompt = `
-你是专业做题助手，请分析 OCR 文本，判断题型后给出答案。
+    async askAI(questionText, optionCount = 0) {
+      const maxChar = String.fromCharCode(65 + optionCount - 1);
+      const rangeStr = optionCount ? `A-${maxChar}` : 'A-D';
+      const prompt = `
+你是专业做题助手，请根据题目文本判断题型后给出答案。
 强约束：
 1) 本题只有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}
-2) 忽略 OCR 错误的选项字母，按出现顺序映射 A/B/C/D...
+2) 按选项出现顺序映射 A/B/C/D...
 3) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对/错
 题目内容：
-${ocrText}
+${questionText}
 `;
-        const systemPrompt = "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。";
-
-        // 构建认证 header
-        const authHeader = AUTH_METHOD === 'x-api-key'
-          ? { 'x-api-key': API_KEY }
-          : { 'Authorization': `Bearer ${API_KEY}` };
-
-        if (API_FORMAT === 'anthropic') {
-          // Anthropic API 格式
-          const headers = {
-            'Content-Type': 'application/json',
-            ...authHeader
-          };
-          // 只有原生 Anthropic API 才需要 anthropic-version，代理通常不需要
-          if (API_URL.includes('api.anthropic.com')) {
-            headers['anthropic-version'] = '2023-06-01';
-          }
-          const requestBody = {
-            model: MODEL_NAME,
-            max_tokens: 1024,
-            system: systemPrompt,
-            messages: [
-              { role: 'user', content: prompt }
-            ]
-          };
-          // 调试日志
-          console.log('[AI请求] URL:', API_URL);
-          console.log('[AI请求] Headers:', headers);
-          console.log('[AI请求] Body:', requestBody);
-          panel.log(`请求 ${API_URL}...`);
-          GM_xmlhttpRequest({
-            method: 'POST',
-            url: API_URL,
-            headers,
-            data: JSON.stringify(requestBody),
-            data: JSON.stringify({
-              model: MODEL_NAME,
-              max_tokens: 1024,
-              system: systemPrompt,
-              messages: [
-                { role: 'user', content: prompt }
-              ]
-            }),
-            timeout: 120000, // 120秒，思考模型需要更长响应时间
-            onload: res => {
-              console.log('[AI响应] Status:', res.status);
-              console.log('[AI响应] Response:', res.responseText);
-              if (res.status === 200) {
-                try {
-                  const json = JSON.parse(res.responseText);
-                  // Anthropic 返回格式: content[0].text
-                  const answerText = json.content?.[0]?.text || json.choices?.[0]?.message?.content;
-                  resolve(answerText);
-                } catch (e) {
-                  reject('JSON 解析失败');
-                }
-              } else {
-                const err = `请求失败: HTTP ${res.status} - ${res.responseText}`;
-                panel.log(err);
-                reject(err);
-              }
-            },
-            onerror: () => reject('网络错误'),
-            ontimeout: () => reject('请求超时')
-          });
-        } else {
-          // OpenAI API 格式（默认）
-          GM_xmlhttpRequest({
-            method: 'POST',
-            url: API_URL,
-            headers: {
-              'Content-Type': 'application/json',
-              ...authHeader
-            },
-            data: JSON.stringify({
-              model: MODEL_NAME,
-              messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: prompt }
-              ],
-              temperature: 0.1
-            }),
-            timeout: 120000, // 120秒，思考模型需要更长响应时间
-            onload: res => {
-              if (res.status === 200) {
-                try {
-                  const json = JSON.parse(res.responseText);
-                  const answerText = json.choices[0].message.content;
-                  resolve(answerText);
-                } catch (e) {
-                  reject('JSON 解析失败');
-                }
-              } else {
-                const err = `请求失败: HTTP ${res.status}`;
-                panel.log(err);
-                reject(err);
-              }
-            },
-            onerror: () => reject('网络错误'),
-            ontimeout: () => reject('请求超时')
-          });
-        }
-      });
+      return this.requestChat(prompt, "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。");
     },
     async autoSelectAndSubmit(aiResponse, itemBodyElement) {
       const match = aiResponse.match(/(?:正确)?答案[：:]?\s*([A-F]+(?:[,，][A-F]+)*|[对错]|正确|错误)/i);
@@ -1769,7 +1807,7 @@ ${ocrText}
         this.updateProgress(this.outside, idx);
         return idx;
       }
-      this.panel.log('进入作业，启动 OCR + AI');
+      this.panel.log('进入作业，读取题目并请求 AI');
       item.click();
       await Utils.sleep(1500);
       let i = 0;
@@ -1796,8 +1834,8 @@ ${ocrText}
           targetEl?.querySelector('.list-unstyled.list-unstyled-radio') ||
           targetEl?.querySelector('ul.list');
         if (listContainer) optionCount = listContainer.querySelectorAll('li').length;
-        const ocrResult = await Solver.recognize(targetEl);
-        if (ocrResult && ocrResult.length > 5) {
+        const questionText = await Solver.captureQuestion(targetEl);
+        if (questionText && questionText.length > 5) {
           let retryCount = 0;
           let success = false;
           while (retryCount < maxRetry && !success) {
@@ -1806,7 +1844,7 @@ ${ocrText}
                 this.panel.log(`🔄 第 ${i + 1} 题重试 ${retryCount}/${maxRetry}...`);
               }
               panel.log('🤖 请求 AI 获取答案...');
-              const aiText = await Solver.askAI(ocrResult, optionCount);
+              const aiText = await Solver.askAI(questionText, optionCount);
               await Solver.autoSelectAndSubmit(aiText, targetEl);
               success = true;
             } catch (err) {
@@ -2291,9 +2329,9 @@ ${ocrText}
         return false;
       }
 
-      const ocrResult = await Solver.recognize(questionRoot);
-      if (!ocrResult || ocrResult.length <= 5) {
-        this.panel.log(`${label || '当前题目'} OCR 结果过短，跳过`);
+      const questionText = await Solver.captureQuestion(questionRoot);
+      if (!questionText || questionText.length <= 5) {
+        this.panel.log(`${label || '当前题目'} 题目内容过短，跳过`);
         return false;
       }
 
@@ -2302,7 +2340,7 @@ ${ocrText}
         try {
           if (retryCount > 0) this.panel.log(`${label || '当前题目'} 重试 ${retryCount}/${maxRetry - 1}`);
           this.panel.log('🤖 请求 AI 获取答案...');
-          const aiText = await Solver.askAI(ocrResult, optionCount);
+          const aiText = await Solver.askAI(questionText, optionCount);
           await Solver.autoSelectAndSubmit(aiText, questionRoot);
           await Utils.sleep(1200);
           return true;

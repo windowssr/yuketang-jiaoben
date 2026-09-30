@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.22
+// @version      3.1.26
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -36,7 +36,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.22',    // 版本号
+    version: '3.1.26',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -60,13 +60,26 @@
       return this.sleep(ms);
     },
     isHumanCheckVisible() {
-      const nodes = document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper, [class*="captcha"], [class*="verify"], [class*="geetest"]');
-      for (const node of nodes) {
-        const style = getComputedStyle(node);
-        const rect = node.getBoundingClientRect();
-        if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0) continue;
-        const text = node.innerText || '';
-        if (/人机|验证码|安全验证|滑动验证|请完成验证|拖动滑块/.test(text)) return true;
+      const pattern = /安全核验|按住.{0,8}起|依次经过|人机|验证码|安全验证|滑动验证|请完成验证|拖动滑块/;
+      const docs = [document];
+      for (const frame of document.querySelectorAll('iframe')) {
+        try {
+          if (frame.contentDocument?.body) docs.push(frame.contentDocument);
+        } catch (_) {}
+      }
+      for (const doc of docs) {
+        const pageText = doc.body?.innerText || '';
+        if (!pattern.test(pageText)) continue;
+        const nodes = doc.querySelectorAll('div, section, p, h1, h2, h3, span');
+        for (const node of nodes) {
+          const text = (node.innerText || '').trim();
+          if (text.length < 4 || text.length > 80 || !pattern.test(text)) continue;
+          const view = doc.defaultView || window;
+          const style = view.getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) continue;
+          return true;
+        }
       }
       return false;
     },
@@ -75,24 +88,17 @@
     },
     async gateHumanCheck() {
       if (!this.isHumanCheckVisible()) {
-        this._humanSkipPending = false;
+        this._humanCheckLogged = false;
         return 'ok';
       }
-      const waitHere = this.humanCheckMode() === 'wait' || this._humanSkipPending;
-      if (waitHere) {
-        panel?.log(this._humanSkipPending
-          ? '验证窗口还在，先停下，避免把后面的章节一并跳过。关掉窗口后会继续'
-          : '检测到人机验证，已停在当前章节，请手动完成后继续');
-        while (this.isHumanCheckVisible()) await this.sleep(1000);
-        const skippedOnce = this._humanSkipPending;
-        this._humanSkipPending = false;
-        panel?.log(skippedOnce ? '验证窗口已关闭，继续下一项' : '人机验证已完成，继续当前章节');
-        return 'waited';
+      if (!this._humanCheckLogged) {
+        panel?.log('检测到安全核验，脚本已停下。请手动拖完后，脚本会继续当前章节');
+        this._humanCheckLogged = true;
       }
-      this._humanSkipPending = true;
-      panel?.log('检测到人机验证，先停留一会儿再进入下一项');
-      await this.humanPause(12000, 20000);
-      return 'skip';
+      while (this.isHumanCheckVisible()) await this.sleep(1000);
+      this._humanCheckLogged = false;
+      panel?.log('安全核验窗口已关闭，继续当前章节');
+      return 'waited';
     },
     async waitIfHumanCheck() {
       return (await this.gateHumanCheck()) !== 'skip';
@@ -1657,25 +1663,31 @@
       const nodes = [...document.querySelectorAll('span, div, em, strong, p')];
       for (const el of nodes) {
         if (!this.isVisibleElement(el)) continue;
-        const text = (el.innerText || '').trim();
+        const text = (el.innerText || '').replace(/\s+/g, '');
         if (text === '未发言' || text === '已发言' || text === '已完成') return text;
       }
       return '';
     },
     forumTopic() {
+      const composer = this.findForumComposer();
+      const composerTop = composer ? composer.getBoundingClientRect().top : Number.POSITIVE_INFINITY;
+      const inOutline = el => Boolean(el.closest('.nav-item-leaf-box, .leaf-item, [class*="leaf"], [class*="nav-item"], [class*="catalog"], [class*="catalogue"], [class*="sidebar"], [class*="outline"]'));
+      const isOutlineTitle = text => /^(视频|音频|课件|图文|作业|考试|讨论)\s*[\d.]/.test(text) || (/^(视频|音频|课件)/.test(text) && text.length < 40);
       const hits = [];
-      for (const el of document.querySelectorAll('body *')) {
-        if (!this.isVisibleElement(el)) continue;
+      for (const el of document.querySelectorAll('p, div, section, h1, h2, h3, span')) {
+        if (!this.isVisibleElement(el) || inOutline(el)) continue;
         if (el.querySelector('textarea, [contenteditable="true"]')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 280 || rect.bottom > composerTop - 4) continue;
         const text = this.normalizeText(el.innerText);
-        if (text.length < 10 || text.length > 240) continue;
-        if (!/[？?]/.test(text)) continue;
-        if (/发表你的观点|Enter发送|未发言|已发言|讨论区/.test(text)) continue;
+        if (text.length < 20 || text.length > 500) continue;
+        if (/发表你的观点|Enter发送|未发言|已发言|讨论区|考核截止/.test(text)) continue;
+        if (/\d{4}-\d{2}-\d{2}/.test(text) || isOutlineTitle(text) || !/[。！？]/.test(text)) continue;
         const sameChild = [...el.children].some(child => this.normalizeText(child.innerText) === text);
         if (sameChild) continue;
-        hits.push({ text, top: el.getBoundingClientRect().top });
+        hits.push({ text, top: rect.top });
       }
-      hits.sort((a, b) => a.top - b.top || a.text.length - b.text.length);
+      hits.sort((a, b) => b.top - a.top);
       return hits[0]?.text || '';
     },
     findForumComposer() {
@@ -1757,8 +1769,32 @@
     }
   };
 
-  // 不再改写页面可见性和 addEventListener。改写这些接口本身就会被当成脚本。
-  function preventScreenCheck() { }
+  // 切走页面时，雨课堂会暂停视频。这里拦住切屏事件，让播放继续。
+  function preventScreenCheck() {
+    const win = unsafeWindow;
+    const blackList = new Set(['visibilitychange', 'blur', 'pagehide']);
+    if (!win._addEventListener) {
+      win._addEventListener = win.addEventListener;
+      win.addEventListener = (...args) => blackList.has(args[0]) ? undefined : win._addEventListener(...args);
+    }
+    if (!document._addEventListener) {
+      document._addEventListener = document.addEventListener;
+      document.addEventListener = (...args) => blackList.has(args[0]) ? undefined : document._addEventListener(...args);
+    }
+    try {
+      Object.defineProperties(document, {
+        hidden: { value: false },
+        visibilityState: { value: 'visible' },
+        hasFocus: { value: () => true },
+        onvisibilitychange: { get: () => undefined, set: () => { } },
+        onblur: { get: () => undefined, set: () => { } }
+      });
+      Object.defineProperties(win, {
+        onblur: { get: () => undefined, set: () => { } },
+        onpagehide: { get: () => undefined, set: () => { } }
+      });
+    } catch (_) {}
+  }
 
   // ---- OCR & AI ----
   const Solver = {
@@ -3303,21 +3339,21 @@ ${questionText}
         return true;
       }
       this.panel.track({ id: stepId, kind: 'forum', title, status: 'doing', detail: topic });
-      this.panel.log('正在根据讨论题写回复...');
+      this.panel.log(`读到的讨论题：${topic.slice(0, 80)}`);
       let reply = '';
       try {
         reply = await Solver.requestChat(
-          `请根据讨论题写一条学生回复。用第一人称，80到140个字，直接回答题目里的问题。不要标题，不要序号，不要引号，不要说自己是模型。\n讨论题：\n${topic}`,
-          '你是在课程讨论区发言的大学生，只输出回复正文。',
+          `下面是讨论题原文。回复必须完成题目里的任务，不要换成别的话题。题目点名的方法、概念要在回复里出现，并按题目要求举一个具体例子。用第一人称，120到180个字。不要标题，不要序号，不要引号。\n讨论题：\n${topic}`,
+          '你是在课程讨论区发言的大学生。只根据讨论题原文作答，不回答题目没问的内容。',
           Solver.answerConf(),
-          256
+          320
         );
       } catch (err) {
         this.panel.log(`讨论回复生成失败：${err.message || err}`);
         this.panel.track({ id: stepId, kind: 'forum', title, status: 'skip', detail: '回复生成失败' });
         return true;
       }
-      reply = String(reply || '').replace(/```[\s\S]*?```/g, '').replace(/^回复[：:]\s*/, '').replace(/\s+/g, '').trim();
+      reply = String(reply || '').replace(/```[\s\S]*?```/g, '').replace(/^回复[：:]\s*/, '').replace(/\n+/g, '').trim();
       if (reply.length > 180) reply = reply.slice(0, 180);
       if (reply.length < 8) {
         this.panel.log('模型没有写出可用回复，跳过');

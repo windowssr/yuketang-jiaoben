@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.6
+// @version      3.1.18
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -14,11 +14,15 @@
 // @connect      api.openai.com
 // @connect      api.moonshot.cn
 // @connect      api.deepseek.com
+// @connect      cn.bing.com
+// @connect      www.bing.com
 // @connect      dashscope.aliyuncs.com
+// @connect      llm-pieg74srnbf94v24.cn-beijing.maas.aliyuncs.com
 // @connect      api.anthropic.com
 // @connect      *
 // @connect      cdn.jsdelivr.net
 // @connect      unpkg.com
+// @require      https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
 // @require      https://unpkg.com/tesseract.js@v2.1.0/dist/tesseract.min.js
 // @downloadURL https://update.greasyfork.org/scripts/466651/%E9%9B%A8%E8%AF%BE%E5%A0%82%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B.user.js
@@ -32,21 +36,54 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.6',     // 版本号
+    version: '3.1.18',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
       progress: '[脚本]刷课进度信息',
       ai: 'ykt_ai_conf',
+      qwen: 'ykt_qwen_conf',
       proClassCount: 'pro_lms_classCount',
       feature: 'ykt_feature_conf', // 是否开启AI作答/自动评论
-      pendingAutoStart: 'ykt_pending_auto_start'
+      pendingAutoStart: 'ykt_pending_auto_start',
+      trail: 'ykt_trail'
     }
   };
 
   const Utils = {
     // 短暂睡眠，等待网页加载
     sleep: (ms = 1000) => new Promise(resolve => setTimeout(resolve, ms)),
+    humanPause(min = 900, max = 2400) {
+      const low = Math.min(min, max);
+      const high = Math.max(min, max);
+      const ms = low + Math.floor(Math.random() * (high - low + 1));
+      return this.sleep(ms);
+    },
+    isHumanCheckVisible() {
+      const nodes = document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper, [class*="captcha"], [class*="verify"], [class*="geetest"]');
+      for (const node of nodes) {
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0) continue;
+        const text = node.innerText || '';
+        if (/人机|验证码|安全验证|滑动验证|请完成验证|拖动滑块/.test(text)) return true;
+      }
+      return false;
+    },
+    async waitIfHumanCheck() {
+      if (!this.isHumanCheckVisible()) return;
+      panel?.log('检测到人机验证，请手动完成，完成后脚本会继续');
+      await this.poll(() => !this.isHumanCheckVisible(), { interval: 1000, timeout: 180000 });
+    },
+    async humanClick(element, min = 800, max = 2000) {
+      if (!element) return;
+      await this.waitIfHumanCheck();
+      try {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      } catch (_) {}
+      await this.humanPause(min, max);
+      element.click();
+    },
     // 将一个 JSON 字符串解析为 JavaScript 对象
     safeJSONParse(value, fallback) {
       try {
@@ -229,6 +266,22 @@
     setAIConf(conf) {
       localStorage.setItem(Config.storageKeys.ai, JSON.stringify(conf));
     },
+    getQwenConf() {
+      const raw = localStorage.getItem(Config.storageKeys.qwen);
+      const saved = Utils.safeJSONParse(raw, {}) || {};
+      const conf = {
+        url: saved.url ?? 'https://llm-pieg74srnbf94v24.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions',
+        key: saved.key ?? '',
+        model: saved.model ?? 'qwen3.8-flash',
+        apiFormat: 'openai',
+        authMethod: 'bearer'
+      };
+      localStorage.setItem(Config.storageKeys.qwen, JSON.stringify(conf));
+      return conf;
+    },
+    setQwenConf(conf) {
+      localStorage.setItem(Config.storageKeys.qwen, JSON.stringify(conf));
+    },
     getProClassCount() {
       const value = localStorage.getItem(Config.storageKeys.proClassCount);
       return value ? Number(value) : 1;
@@ -242,6 +295,7 @@
       const conf = {
         autoAI: saved.autoAI ?? false,
         autoComment: saved.autoComment ?? false,
+        answerProvider: saved.answerProvider === 'deepseek' ? 'deepseek' : 'qwen',
       };
       localStorage.setItem(Config.storageKeys.feature, JSON.stringify(conf));
       return conf;
@@ -271,6 +325,25 @@
     clearPendingAutoStart() {
       localStorage.removeItem(Config.storageKeys.pendingAutoStart);
     },
+    trailScope() {
+      return Utils.getCurrentClassroomId()
+        || this.getPendingAutoStart()?.classroomId
+        || location.pathname;
+    },
+    getTrail() {
+      const all = Utils.safeJSONParse(localStorage.getItem(Config.storageKeys.trail), {}) || {};
+      return all[this.trailScope()] || { currentTitle: '', currentDetail: '', steps: [] };
+    },
+    saveTrail(trail) {
+      const all = Utils.safeJSONParse(localStorage.getItem(Config.storageKeys.trail), {}) || {};
+      all[this.trailScope()] = trail;
+      localStorage.setItem(Config.storageKeys.trail, JSON.stringify(all));
+    },
+    clearTrail() {
+      const all = Utils.safeJSONParse(localStorage.getItem(Config.storageKeys.trail), {}) || {};
+      delete all[this.trailScope()];
+      localStorage.setItem(Config.storageKeys.trail, JSON.stringify(all));
+    },
   };
 
   // ---- UI 面板 ----
@@ -279,8 +352,8 @@
     iframe.style.position = 'fixed';
     iframe.style.top = '40px';
     iframe.style.left = '40px';
-    iframe.style.width = '520px';
-    iframe.style.height = '340px';
+    iframe.style.width = '600px';
+    iframe.style.height = '640px';
     iframe.style.zIndex = '999999';
     iframe.style.border = '1px solid #a3a3a3';
     iframe.style.borderRadius = '10px';
@@ -375,19 +448,144 @@
                 font-size: 13px;
                 line-height: 22px;
                 height: calc(100% - 85px);
-                overflow-y: auto;
-                padding: 6px 8px;
+                overflow: hidden;
+                padding: 8px 10px 4px;
                 box-sizing: border-box;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                background: #f6f8fb;
               }
-
+              .status {
+                background: #fff;
+                border: 1px solid #e6eef8;
+                border-radius: 8px;
+                padding: 8px 10px;
+                flex: none;
+              }
+              .status-label {
+                font-size: 11px;
+                color: #8c8c8c;
+                letter-spacing: 0.04em;
+              }
+              .status-main {
+                font-size: 14px;
+                font-weight: 600;
+                color: #1f1f1f;
+                line-height: 20px;
+              }
+              .status-sub {
+                font-size: 12px;
+                color: #1677ff;
+                line-height: 18px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+              }
+              .timeline {
+                flex: 1;
+                overflow-y: auto;
+                padding: 2px 2px 2px 0;
+              }
+              .step {
+                display: grid;
+                grid-template-columns: 16px 1fr;
+                gap: 8px;
+                margin: 0 0 8px;
+              }
+              .step-rail {
+                position: relative;
+              }
+              .step-rail::before {
+                content: "";
+                position: absolute;
+                left: 5px;
+                top: 12px;
+                bottom: -10px;
+                width: 2px;
+                background: #e5eaf1;
+              }
+              .step:last-child .step-rail::before { display: none; }
+              .step-dot {
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                background: #1677ff;
+                margin-top: 4px;
+                position: relative;
+                z-index: 1;
+              }
+              .step.done .step-dot { background: #52c41a; }
+              .step.skip .step-dot { background: #bfbfbf; }
+              .step-card {
+                background: #fff;
+                border: 1px solid #e8eef5;
+                border-radius: 8px;
+                padding: 7px 9px;
+              }
+              .step-head {
+                display: flex;
+                justify-content: space-between;
+                gap: 8px;
+                align-items: baseline;
+              }
+              .step-kind {
+                font-size: 11px;
+                color: #1677ff;
+                background: #e6f4ff;
+                border-radius: 4px;
+                padding: 0 5px;
+                margin-right: 6px;
+              }
+              .step.done .step-kind { color: #389e0d; background: #f6ffed; }
+              .step.skip .step-kind { color: #8c8c8c; background: #f5f5f5; }
+              .step-title {
+                font-size: 13px;
+                color: #1f1f1f;
+                font-weight: 600;
+              }
+              .step-state {
+                font-size: 11px;
+                color: #8c8c8c;
+                flex: none;
+              }
+              .step-detail {
+                margin-top: 4px;
+                font-size: 12px;
+                color: #595959;
+                line-height: 18px;
+                white-space: pre-wrap;
+                max-height: 200px;
+                overflow: auto;
+              }
+              .empty-trail {
+                color: #8c8c8c;
+                font-size: 12px;
+                padding: 12px 4px;
+              }
+              .runlog {
+                flex: none;
+                background: #fff;
+                border: 1px solid #e8eef5;
+                border-radius: 8px;
+                padding: 4px 8px;
+              }
+              .runlog summary {
+                cursor: pointer;
+                font-size: 12px;
+                color: #8c8c8c;
+              }
               .info {
-                margin: 0;
+                margin: 4px 0 0;
                 padding: 0;
                 list-style: none;
+                max-height: 160px;
+                overflow-y: auto;
               }
               .info li {
-                margin-bottom: 4px;
-                color: #333;
+                margin-bottom: 2px;
+                color: #666;
+                font-size: 12px;
               }
 
               /* 设置面板 */
@@ -398,16 +596,67 @@
                 left: 0;
                 width: 100%;
                 height: calc(100% - 40px);
-                background: white;
+                background: #f4f7fb;
                 z-index: 99;
-                padding: 15px;
+                padding: 16px 16px 12px;
                 box-sizing: border-box;
                 overflow-y: auto;
+              }
+              .settings-card {
+                background: #fff;
+                border: 1px solid #e6eef8;
+                border-radius: 12px;
+                padding: 14px 14px 6px;
+                margin-bottom: 14px;
+              }
+              .settings-card.is-selected {
+                border-color: #91caff;
+                box-shadow: 0 0 0 2px rgba(22, 119, 255, 0.12);
+              }
+              .card-title {
+                font-size: 14px;
+                font-weight: 650;
+                color: #1f1f1f;
+                margin-bottom: 6px;
+              }
+              .card-hint {
+                margin: 0 0 12px;
+                font-size: 12px;
+                line-height: 18px;
+                color: #8c8c8c;
+              }
+              .choice-row {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 4px;
+              }
+              .choice {
+                flex: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 6px;
+                border: 1px solid #d9e2ef;
+                border-radius: 8px;
+                padding: 10px 8px;
+                font-size: 13px;
+                color: #1f1f1f;
+                cursor: pointer;
+                background: #fafcff;
+              }
+              .choice:has(input:checked) {
+                border-color: #1677ff;
+                background: #e6f4ff;
+                color: #0958d9;
+                font-weight: 650;
+              }
+              .choice input {
+                margin: 0;
               }
 
               /* 表单项 */
               .form-item {
-                margin-bottom: 15px;
+                margin-bottom: 12px;
               }
               .form-item label {
                 display: block;
@@ -488,10 +737,15 @@
               /* 设置页底部按钮 */
               .settings-footer {
                 text-align: center;
-                margin-top: 12px;
+                margin-top: 4px;
                 display: flex;
+                flex-wrap: wrap;
                 justify-content: center;
                 gap: 10px;
+                position: sticky;
+                bottom: 0;
+                background: #f4f7fb;
+                padding: 12px 0 4px;
               }
               .settings-footer button {
                 padding: 6px 15px;
@@ -506,6 +760,10 @@
               }
               #test_settings {
                 background-color: #13c2c2;
+                color: white;
+              }
+              #test_qwen {
+                background-color: #722ed1;
                 color: white;
               }
               #close_settings {
@@ -526,60 +784,94 @@
                 </div>
               </div>
               <div class="body">
-                <ul class="info" id="info">
-                  <li>⭐ 脚本支持：所有版本</li>
-                  <li>🤖 <strong>支持模型：</strong>DeepSeek、Kimi(Moonshot)、通义千问、OpenAI、Claude(Anthropic)</li>
-                  <li>📢 <strong>使用必读：</strong>自动答题需先点击<span style="color:green">[AI配置]</span>开启并填入API Key</li>
-                  <li>🚀 配置完成后，点击<span style="color:blue">[开始刷课]</span>即可启动视频与作业挂机</li>
-                  <li>🤝 脚本还有很多不足，欢迎各位一起完善代码</li>
-                  <hr>
-                </ul>
+                <div class="status">
+                  <div class="status-label">当前进度</div>
+                  <div class="status-main" id="trail-current">等待开始</div>
+                  <div class="status-sub" id="trail-sub">开始刷课后，这里会记下课程、视频和题目</div>
+                </div>
+                <div class="timeline" id="timeline"></div>
+                <details class="runlog">
+                  <summary>运行日志</summary>
+                  <ul class="info" id="info"></ul>
+                </details>
               </div>
               <div id="settings">
-                <div class="form-item">
-                  <label>API URL:</label>
-                  <input type="text" id="ai_url" placeholder="https://api.deepseek.com/chat/completions">
+                <div class="settings-card">
+                  <div class="card-title">答题使用哪个模型</div>
+                  <p class="card-hint">看图、复述题目和最后作答都走这里选中的模型。另一个模型的配置会保留。</p>
+                  <div class="choice-row">
+                    <label class="choice"><input type="radio" name="answer_provider" value="qwen"> 通义千问</label>
+                    <label class="choice"><input type="radio" name="answer_provider" value="deepseek"> DeepSeek</label>
+                  </div>
                 </div>
-                <div class="form-item">
-                  <label>API KEY:</label>
-                  <input type="password" id="ai_key" placeholder="sk-xxxxxxxx">
+                <div class="settings-card" id="card-qwen">
+                  <div class="card-title">通义千问</div>
+                  <p class="card-hint">适合看截图。默认模型 qwen3.8-flash。</p>
+                  <div class="form-item">
+                    <label>API URL</label>
+                    <input type="text" id="qwen_url" placeholder="https://.../compatible-mode/v1/chat/completions">
+                  </div>
+                  <div class="form-item">
+                    <label>API Key</label>
+                    <input type="password" id="qwen_key" placeholder="百炼或 MaaS 的 Key">
+                  </div>
+                  <div class="form-item">
+                    <label>模型名</label>
+                    <input type="text" id="qwen_model" placeholder="qwen3.8-flash">
+                  </div>
                 </div>
-                <div class="form-item">
-                  <label>Model Name:</label>
-                  <input type="text" id="ai_model" placeholder="deepseek-flash">
+                <div class="settings-card" id="card-deepseek">
+                  <div class="card-title">DeepSeek</div>
+                  <p class="card-hint">保留给其他任务，也可以选它来答题。</p>
+                  <div class="form-item">
+                    <label>API URL</label>
+                    <input type="text" id="ai_url" placeholder="https://api.deepseek.com/chat/completions">
+                  </div>
+                  <div class="form-item">
+                    <label>API Key</label>
+                    <input type="password" id="ai_key" placeholder="sk-xxxxxxxx">
+                  </div>
+                  <div class="form-item">
+                    <label>模型名</label>
+                    <input type="text" id="ai_model" placeholder="deepseek-flash">
+                  </div>
+                  <div class="form-item">
+                    <label>接口格式</label>
+                    <select id="ai_format" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
+                      <option value="openai">OpenAI（Chat Completions）</option>
+                      <option value="anthropic">Anthropic（Messages）</option>
+                    </select>
+                  </div>
+                  <div class="form-item">
+                    <label>认证方式</label>
+                    <select id="auth_method" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
+                      <option value="bearer">Bearer Token</option>
+                      <option value="x-api-key">X-API-Key</option>
+                    </select>
+                  </div>
                 </div>
-                <div class="form-item">
-                  <label>API Format:</label>
-                  <select id="ai_format" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
-                    <option value="openai">OpenAI Format (Chat Completions)</option>
-                    <option value="anthropic">Anthropic Format (Messages API)</option>
-                  </select>
-                </div>
-                <div class="form-item">
-                  <label>Auth Method:</label>
-                  <select id="auth_method" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
-                    <option value="bearer">Bearer Token (Authorization: Bearer)</option>
-                    <option value="x-api-key">X-API-Key Header</option>
-                  </select>
-                </div>
-                <div class="form-item">
-                  <label class="checkbox-label">
-                    <input type="checkbox" id="feature_auto_ai">
-                    用 AI 自动作答（作业/题目）
-                  </label>
-                </div>
-                <div class="form-item">
-                  <label class="checkbox-label">
-                    <input type="checkbox" id="feature_auto_comment">
-                    用批量区图文/讨论自动回复
-                  </label>
+                <div class="settings-card">
+                  <div class="card-title">开关</div>
+                  <div class="form-item">
+                    <label class="checkbox-label">
+                      <input type="checkbox" id="feature_auto_ai">
+                      自动作答作业和题目
+                    </label>
+                  </div>
+                  <div class="form-item">
+                    <label class="checkbox-label">
+                      <input type="checkbox" id="feature_auto_comment">
+                      批量区图文和讨论自动回复
+                    </label>
+                  </div>
                 </div>
                 <div class="settings-footer">
-                  <button id="test_settings">测试连接</button>
+                  <button id="test_qwen">测试千问</button>
+                  <button id="test_settings">测试 DeepSeek</button>
                   <button id="save_settings">保存并关闭</button>
                   <button id="close_settings">取消</button>
                 </div>
-                <div id="ai_test_result" style="font-size:12px;margin-top:8px;text-align:center;min-height:18px;"></div>
+                <div id="ai_test_result" style="font-size:12px;margin:8px 0 12px;text-align:center;min-height:18px;color:#595959;"></div>
               </div>
               <div class="footer">
                 <button id="btn-setting">AI配置</button>
@@ -598,6 +890,9 @@
       panel: doc.getElementById('panel'),
       header: doc.getElementById('header'),
       info: doc.getElementById('info'),
+      timeline: doc.getElementById('timeline'),
+      trailCurrent: doc.getElementById('trail-current'),
+      trailSub: doc.getElementById('trail-sub'),
       btnStart: doc.getElementById('btn-start'),
       btnClear: doc.getElementById('btn-clear'),
       btnSetting: doc.getElementById('btn-setting'),
@@ -606,11 +901,15 @@
       settings: doc.getElementById('settings'),
       saveSettings: doc.getElementById('save_settings'),
       testSettings: doc.getElementById('test_settings'),
+      testQwen: doc.getElementById('test_qwen'),
       aiTestResult: doc.getElementById('ai_test_result'),
       closeSettings: doc.getElementById('close_settings'),
       aiUrlInput: doc.getElementById('ai_url'),
       aiKeyInput: doc.getElementById('ai_key'),
       aiModelInput: doc.getElementById('ai_model'),
+      qwenUrlInput: doc.getElementById('qwen_url'),
+      qwenKeyInput: doc.getElementById('qwen_key'),
+      qwenModelInput: doc.getElementById('qwen_model'),
       aiFormatSelect: doc.getElementById('ai_format'),
       authMethodSelect: doc.getElementById('auth_method'),
       featureAutoAI: doc.getElementById('feature_auto_ai'),
@@ -680,10 +979,101 @@
       window.parent.alert('作者：niuwh.cn（重构版 by Codex）');
     });
 
+    const escapeHtml = value => String(value || '').replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+    const kindText = {
+      video: '视频', audio: '音频', ppt: '课件', course: '课程', question: '题目', homework: '作业'
+    };
+    const stateText = { doing: '进行中', done: '已结束', skip: '已跳过' };
+    const renderTrail = trail => {
+      const current = trail.currentTitle || '等待开始';
+      ui.trailCurrent.textContent = current;
+      ui.trailSub.textContent = trail.currentDetail || '开始刷课后，这里会记下课程、视频和题目';
+      const steps = trail.steps || [];
+      if (!steps.length) {
+        ui.timeline.innerHTML = '<div class="empty-trail">还没有记录。开始刷课后，结束的课程、正在播放的视频和题目内容会出现在这里。</div>';
+        return;
+      }
+      ui.timeline.innerHTML = steps.map(step => {
+        const state = step.status || 'doing';
+        const detail = step.detail ? `<div class="step-detail">${escapeHtml(step.detail)}</div>` : '';
+        return `<div class="step ${state}">
+          <div class="step-rail"><div class="step-dot"></div></div>
+          <div class="step-card">
+            <div class="step-head">
+              <div class="step-title"><span class="step-kind">${kindText[step.kind] || '记录'}</span>${escapeHtml(step.title)}</div>
+              <div class="step-state">${stateText[state] || ''}</div>
+            </div>
+            ${detail}
+          </div>
+        </div>`;
+      }).join('');
+      ui.timeline.scrollTop = ui.timeline.scrollHeight;
+    };
+    const track = step => {
+      const trail = Store.getTrail();
+      const steps = trail.steps || [];
+      const next = {
+        id: step.id,
+        kind: step.kind || 'course',
+        title: String(step.title || '未命名').slice(0, 80),
+        detail: step.detail == null ? (steps.find(item => item.id === step.id)?.detail || '') : String(step.detail).slice(0, 500),
+        status: step.status || 'doing'
+      };
+      const index = steps.findIndex(item => item.id === next.id);
+      if (index >= 0) steps[index] = { ...steps[index], ...next };
+      else steps.push(next);
+      if (steps.length > 60) steps.splice(0, steps.length - 60);
+      trail.steps = steps;
+      if (next.status === 'doing') {
+        trail.currentTitle = next.title;
+        trail.currentDetail = next.kind === 'question' ? '正在做题' : `${kindText[next.kind] || '内容'}进行中`;
+      } else if (trail.currentTitle === next.title) {
+        trail.currentTitle = next.status === 'done' ? `${next.title} 已结束` : next.title;
+        trail.currentDetail = next.detail || trail.currentDetail;
+      }
+      Store.saveTrail(trail);
+      renderTrail(trail);
+    };
+    const showQuestion = text => {
+      const body = String(text || '').trim().slice(0, 800);
+      const trail = Store.getTrail();
+      const steps = trail.steps || [];
+      const current = [...steps].reverse().find(item => item.kind === 'question' && item.status === 'doing')
+        || [...steps].reverse().find(item => item.kind === 'question');
+      if (current) {
+        current.detail = body;
+        trail.currentTitle = current.title;
+        trail.currentDetail = '请核对下面复述的题目';
+      }
+      Store.saveTrail(trail);
+      renderTrail(trail);
+      const runlog = doc.querySelector('.runlog');
+      if (runlog) runlog.open = true;
+      log('模型复述的题目：');
+      log(body);
+    };
+    const noteAnswer = answer => {
+      const trail = Store.getTrail();
+      const steps = trail.steps || [];
+      const current = [...steps].reverse().find(item => item.kind === 'question' && item.status === 'doing')
+        || [...steps].reverse().find(item => item.kind === 'question');
+      if (!current) return;
+      const choice = `选择：${answer}`;
+      current.detail = current.detail && !current.detail.includes(choice) ? `${current.detail}\n${choice}` : (current.detail || choice);
+      current.status = 'done';
+      trail.currentDetail = choice;
+      Store.saveTrail(trail);
+      renderTrail(trail);
+    };
+    renderTrail(Store.getTrail());
+
     const log = message => {
       const li = doc.createElement('li');
       li.innerText = message;
       ui.info.appendChild(li);
+      ui.trailSub.textContent = message;
       if (ui.info.lastElementChild) ui.info.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'end', inline: 'nearest' });
     };
 
@@ -709,12 +1099,28 @@
       ui.aiModelInput.value = saved.model || defaultAI.model;
       ui.aiFormatSelect.value = saved.apiFormat || defaultAI.apiFormat;
       ui.authMethodSelect.value = saved.authMethod || defaultAI.authMethod;
+      const qwen = Store.getQwenConf();
+      ui.qwenUrlInput.value = qwen.url;
+      ui.qwenKeyInput.value = qwen.key;
+      ui.qwenModelInput.value = qwen.model;
     };
     const loadFeatureConf = () => {
       const saved = Store.getFeatureConf();
       ui.featureAutoAI.checked = saved.autoAI;
       ui.featureAutoComment.checked = saved.autoComment;
+      const provider = saved.answerProvider === 'deepseek' ? 'deepseek' : 'qwen';
+      const picked = doc.querySelector(`input[name="answer_provider"][value="${provider}"]`);
+      if (picked) picked.checked = true;
+      syncProviderCards();
     };
+    const syncProviderCards = () => {
+      const provider = doc.querySelector('input[name="answer_provider"]:checked')?.value || 'qwen';
+      doc.getElementById('card-qwen')?.classList.toggle('is-selected', provider === 'qwen');
+      doc.getElementById('card-deepseek')?.classList.toggle('is-selected', provider === 'deepseek');
+    };
+    doc.querySelectorAll('input[name="answer_provider"]').forEach(input => {
+      input.addEventListener('change', syncProviderCards);
+    });
     loadAIConf();
     loadFeatureConf();
     ui.btnSetting.onclick = () => {
@@ -732,6 +1138,13 @@
       apiFormat: ui.aiFormatSelect.value,
       authMethod: ui.authMethodSelect.value
     });
+    const readFormQwenConf = () => ({
+      url: ui.qwenUrlInput.value.trim(),
+      key: ui.qwenKeyInput.value.trim(),
+      model: ui.qwenModelInput.value.trim() || 'qwen3.8-flash',
+      apiFormat: 'openai',
+      authMethod: 'bearer'
+    });
     ui.testSettings.onclick = async () => {
       const conf = readFormAIConf();
       ui.aiTestResult.innerText = '正在测试...';
@@ -747,12 +1160,29 @@
         ui.testSettings.disabled = false;
       }
     };
+    ui.testQwen.onclick = async () => {
+      const conf = readFormQwenConf();
+      ui.aiTestResult.innerText = '正在测试千问...';
+      ui.testQwen.disabled = true;
+      try {
+        const reply = await Solver.ping(conf);
+        ui.aiTestResult.innerText = `千问连接成功：${String(reply || '').replace(/\s+/g, ' ').trim().slice(0, 40)}`;
+        log('✅ 千问连接测试成功');
+      } catch (err) {
+        ui.aiTestResult.innerText = String(err);
+        log(`千问连接测试失败：${err}`);
+      } finally {
+        ui.testQwen.disabled = false;
+      }
+    };
     ui.saveSettings.onclick = () => {
       const conf = readFormAIConf();
       Store.setAIConf(conf);
+      Store.setQwenConf(readFormQwenConf());
       const featureConf = {
         autoAI: ui.featureAutoAI.checked,
-        autoComment: ui.featureAutoComment.checked
+        autoComment: ui.featureAutoComment.checked,
+        answerProvider: doc.querySelector('input[name="answer_provider"]:checked')?.value === 'deepseek' ? 'deepseek' : 'qwen'
       };
       Store.setFeatureConf(featureConf);
       ui.settings.style.display = 'none';
@@ -763,6 +1193,8 @@
       Store.removeProgress(window.parent.location.href);
       localStorage.removeItem(Config.storageKeys.proClassCount);
       Store.clearPendingAutoStart();
+      Store.clearTrail();
+      renderTrail(Store.getTrail());
       log('已清除当前课程的刷课进度缓存');
     };
 
@@ -799,6 +1231,9 @@
       log,
       warn,
       error,
+      track,
+      showQuestion,
+      noteAnswer,
       setStartHandler(fn) {
         startHandler = fn;
         ui.btnStart.onclick = invokeStart;
@@ -1247,14 +1682,162 @@
       if (!element) return '';
       return String(element.innerText || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     },
-    async captureQuestion(element) {
-      const text = this.readQuestion(element);
-      if (text.replace(/\s/g, '').length > 8) {
-        panel.log('已从页面读取题目');
-        return text;
+    stripReviewNoise(text) {
+      return String(text || '')
+        .replace(/本题得分[：:][^\n]*/g, '')
+        .replace(/正确答案[：:][^\n]*/g, '')
+        .replace(/查看解析/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    },
+    modelCanSee() {
+      const conf = this.normalizeConf(this.answerConf());
+      const keyOk = Boolean(conf.key) && !String(conf.key).includes('xxxx');
+      if (!keyOk) return false;
+      if (/deepseek\.com/.test(conf.url || '') && /deepseek-flash/.test(conf.model || '')) return true;
+      return /qwen/i.test(conf.model || '');
+    },
+    answerConf() {
+      return Store.getFeatureConf().answerProvider === 'deepseek' ? Store.getAIConf() : Store.getQwenConf();
+    },
+    examFontUrl(doc) {
+      const root = doc || document;
+      for (const style of root.querySelectorAll('style')) {
+        const html = style.textContent || '';
+        if (!/exam-data-decrypt-font|exam_font/.test(html)) continue;
+        const matched = html.match(/url\((['"]?)([^"')]+)\1\)/);
+        if (matched) return new URL(matched[2], root.baseURI || location.href).href;
       }
-      panel.log('页面文字不足，改用 OCR');
-      return this.recognize(element);
+      for (const sheet of root.styleSheets || []) {
+        let rules;
+        try { rules = sheet.cssRules; } catch (_) { continue; }
+        for (const rule of rules) {
+          if (!(rule instanceof CSSFontFaceRule)) continue;
+          const src = rule.style.getPropertyValue('src') || '';
+          const family = rule.style.getPropertyValue('font-family') || '';
+          if (!/exam_font|exam-data-decrypt-font/.test(`${src} ${family}`)) continue;
+          const matched = src.match(/url\((['"]?)([^"')]+)\1\)/);
+          if (matched) return new URL(matched[2], root.baseURI || location.href).href;
+        }
+      }
+      return '';
+    },
+    async loadArrayBuffer(url) {
+      if (url.startsWith('blob:') || url.startsWith(location.origin)) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`字体下载失败 HTTP ${response.status}`);
+        return response.arrayBuffer();
+      }
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          responseType: 'arraybuffer',
+          timeout: 30000,
+          onload: res => res.status === 200 ? resolve(res.response) : reject(new Error(`字体下载失败 HTTP ${res.status}`)),
+          onerror: () => reject(new Error('字体下载失败')),
+          ontimeout: () => reject(new Error('字体下载超时'))
+        });
+      });
+    },
+    async hashGlyph(commands) {
+      let source = '';
+      for (const command of commands || []) {
+        const pairs = Object.entries(command).sort((a, b) => a[0] === b[0] ? (a[1] < b[1] ? -1 : 1) : (a[0] < b[0] ? -1 : 1));
+        for (const [key, value] of pairs) source += `${key}${value}`;
+      }
+      const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(source));
+      return [...new Uint8Array(digest).slice(0, 8)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    },
+    async loadGlyphHashMap() {
+      if (this._glyphHashMap) return this._glyphHashMap;
+      panel.log('正在加载字体对照表...');
+      const source = await new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: 'https://cdn.jsdelivr.net/gh/novob/yuketang-deobfuscator@main/yuketang-deobfuscator.user.js',
+          timeout: 30000,
+          onload: res => res.status === 200 ? resolve(res.responseText) : reject(new Error(`对照表下载失败 HTTP ${res.status}`)),
+          onerror: () => reject(new Error('对照表下载失败')),
+          ontimeout: () => reject(new Error('对照表下载超时'))
+        });
+      });
+      const matched = String(source || '').match(/const MAP_DATA = "([^"]+)"/);
+      if (!matched) throw new Error('字体对照表格式已变化');
+      const raw = atob(matched[1]);
+      const bytes = Uint8Array.from(raw, char => char.charCodeAt(0));
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+      const packed = new Uint8Array(await new Response(stream).arrayBuffer());
+      const map = {};
+      for (let i = 0; i + 10 < packed.length; i += 11) {
+        let hash = '';
+        for (let j = 0; j < 8; j++) hash += packed[i + j].toString(16).padStart(2, '0');
+        map[hash] = (packed[i + 8] << 16) | (packed[i + 9] << 8) | packed[i + 10];
+      }
+      this._glyphHashMap = map;
+      return map;
+    },
+    async decodeQuestion(element) {
+      const raw = this.stripReviewNoise(this.readQuestion(element));
+      const chars = [...new Set(raw.match(/[\u4e00-\u9fff]/g) || [])];
+      if (!chars.length) return raw;
+      const parser = window.opentype || (typeof opentype !== 'undefined' ? opentype : null);
+      if (!parser) throw new Error('字体解析库未加载');
+      const fontUrl = this.examFontUrl(element.ownerDocument || document);
+      if (!fontUrl) throw new Error('没有找到加密字体');
+      if (!this._fontCache) this._fontCache = {};
+      if (!this._fontCache[fontUrl]) {
+        const buffer = await this.loadArrayBuffer(fontUrl);
+        this._fontCache[fontUrl] = parser.parse(buffer);
+      }
+      const font = this._fontCache[fontUrl];
+      const hashMap = await this.loadGlyphHashMap();
+      const mapping = {};
+      for (const char of chars) {
+        const glyph = font.charToGlyph(char);
+        if (!glyph?.path?.commands?.length) continue;
+        const hash = await this.hashGlyph(glyph.path.commands);
+        const delta = hashMap[hash];
+        if (delta !== undefined) mapping[char] = String.fromCodePoint(delta + 0x3400);
+      }
+      const mapped = Object.keys(mapping).length;
+      panel.log(`字体还原 ${mapped}/${chars.length} 个字`);
+      if (mapped < Math.max(3, Math.ceil(chars.length * 0.5))) return '';
+      return raw.replace(/[\u4e00-\u9fff]/g, char => mapping[char] || char);
+    },
+    async shootQuestion(element) {
+      panel.log('正在截图...');
+      const canvas = await html2canvas(element, {
+        useCORS: true,
+        logging: false,
+        scale: 2,
+        backgroundColor: '#ffffff'
+      });
+      return canvas.toDataURL('image/png');
+    },
+    async captureQuestion(element) {
+      if (!element) return null;
+      try {
+        const decoded = await this.decodeQuestion(element);
+        if (decoded && decoded.replace(/\s/g, '').length > 8) {
+          panel.log('已按加密字体还原题目');
+          return { image: '', text: decoded };
+        }
+      } catch (err) {
+        panel.log(`字体还原失败：${err.message || err}`);
+      }
+      try {
+        const image = await this.shootQuestion(element);
+        if (image && this.modelCanSee()) {
+          panel.log('字体还原失败，改用截图');
+          return { image, text: '题目截图' };
+        }
+        const text = await this.recognize(element);
+        return { image: '', text: this.stripReviewNoise(text) };
+      } catch (err) {
+        panel.log(`截图失败：${err.message || err}`);
+        return null;
+      }
     },
     normalizeConf(conf) {
       const next = { ...conf };
@@ -1266,6 +1849,18 @@
         'deepseek-v4-flash': 'deepseek-flash'
       };
       if (url.includes('deepseek.com') && retiredModels[next.model]) next.model = retiredModels[next.model];
+      if (url.includes('maas.aliyuncs.com') || url.includes('dashscope.aliyuncs.com')) {
+        try {
+          const parsed = new URL(url);
+          const path = parsed.pathname.replace(/\/+$/, '');
+          if (path.endsWith('/v1') || path.endsWith('/compatible-mode/v1')) {
+            parsed.pathname = `${path}/chat/completions`;
+            parsed.search = '';
+            parsed.hash = '';
+            url = parsed.toString();
+          }
+        } catch (_) {}
+      }
       if (url.includes('deepseek.com') && (next.apiFormat || 'openai') !== 'anthropic') {
         try {
           const parsed = new URL(url);
@@ -1281,7 +1876,7 @@
       next.url = url;
       return next;
     },
-    requestChat(prompt, systemPrompt, confOverride = null, maxTokens = 1024) {
+    requestChat(prompt, systemPrompt, confOverride = null, maxTokens = 1024, images = null) {
       const saved = this.normalizeConf(confOverride || Store.getAIConf());
       const API_URL = saved.url;
       const API_KEY = saved.key;
@@ -1303,6 +1898,13 @@
           ? { 'x-api-key': API_KEY }
           : { 'Authorization': `Bearer ${API_KEY}` };
         const headers = { 'Content-Type': 'application/json', ...authHeader };
+        const imageList = Array.isArray(images) ? images.filter(Boolean) : [];
+        const userContent = imageList.length && API_FORMAT !== 'anthropic'
+          ? [
+            { type: 'text', text: prompt },
+            ...imageList.map(url => ({ type: 'image_url', image_url: { url, detail: 'high' } }))
+          ]
+          : prompt;
         let body;
         if (API_FORMAT === 'anthropic') {
           if (API_URL.includes('api.anthropic.com')) headers['anthropic-version'] = '2023-06-01';
@@ -1317,12 +1919,13 @@
             model: MODEL_NAME,
             messages: [
               { role: 'system', content: systemPrompt },
-              { role: 'user', content: prompt }
+              { role: 'user', content: userContent }
             ],
             temperature: 0.1,
             max_tokens: maxTokens
           };
           if (String(API_URL).includes('deepseek.com')) body.thinking = { type: 'disabled' };
+          if (String(API_URL).includes('aliyuncs.com') || /qwen/i.test(MODEL_NAME)) body.enable_thinking = false;
         }
         GM_xmlhttpRequest({
           method: 'POST',
@@ -1334,7 +1937,7 @@
             if (res.status !== 200) {
               const bodyText = String(res.responseText || (typeof res.response === 'string' ? res.response : '') || '').trim();
               const err = (res.status === 404 && !bodyText)
-                ? '请求被篡改猴拦截，没有发到 DeepSeek。请确认脚本最上面有 // @connect api.deepseek.com，保存后在篡改猴里允许这个域名。API URL 填 https://api.deepseek.com/chat/completions'
+                ? `请求被篡改猴拦截。请确认脚本头部允许访问该域名，并在篡改猴里放行。当前地址：${API_URL}`
                 : `请求失败: HTTP ${res.status} - ${bodyText.slice(0, 180)}`;
               panel.log(err);
               reject(err);
@@ -1364,6 +1967,65 @@
     ping(conf) {
       return this.requestChat('只回复两个字：成功', '你是连接测试助手，只按用户要求回复。', conf, 64);
     },
+    httpGet(url) {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          timeout: 20000,
+          headers: {
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+          },
+          onload: res => {
+            if (res.status !== 200 || !res.responseText) {
+              reject(new Error(`HTTP ${res.status}`));
+              return;
+            }
+            resolve(res.responseText);
+          },
+          onerror: () => reject(new Error('网络错误')),
+          ontimeout: () => reject(new Error('超时'))
+        });
+      });
+    },
+    searchQuery(questionText) {
+      let text = String(questionText || '').replace(/\s+/g, ' ').trim();
+      text = text.replace(/^(单选题|多选题|判断题|填空题|选择题)\s*/, '');
+      const optionAt = text.search(/\s[A-F][\.、．]/);
+      if (optionAt > 8) text = text.slice(0, optionAt);
+      return text.slice(0, 80).trim();
+    },
+    extractSearchSnippets(html) {
+      const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+      const nodes = doc.querySelectorAll('li.b_algo h2, li.b_algo p, .b_caption p');
+      const snippets = [];
+      nodes.forEach(node => {
+        const text = String(node.innerText || '').replace(/\s+/g, ' ').trim();
+        if (text.length < 12 || snippets.includes(text)) return;
+        snippets.push(text.slice(0, 240));
+      });
+      snippets.sort((a, b) => Number(/答案|正确/.test(b)) - Number(/答案|正确/.test(a)));
+      return snippets.slice(0, 5);
+    },
+    async searchQuestion(questionText) {
+      const query = this.searchQuery(questionText);
+      if (query.length < 6) return '';
+      panel.log('正在搜题...');
+      try {
+        const html = await this.httpGet(`https://cn.bing.com/search?q=${encodeURIComponent(query + ' 答案')}&setlang=zh-Hans`);
+        const snippets = this.extractSearchSnippets(html);
+        if (!snippets.length) {
+          panel.log('没有搜到可用结果，改由 AI 直接作答');
+          return '';
+        }
+        panel.log(`搜到 ${snippets.length} 条结果，交给 AI 对照`);
+        return snippets.join('\n');
+      } catch (err) {
+        panel.log(`搜题失败，改由 AI 直接作答：${err.message || err}`);
+        return '';
+      }
+    },
     async recognize(element) {
       if (!element) return '无元素';
       try {
@@ -1389,19 +2051,53 @@
         return 'OCR识别出错';
       }
     },
-    async askAI(questionText, optionCount = 0) {
+    async askAI(questionText, optionCount = 0, image = '') {
       const maxChar = String.fromCharCode(65 + optionCount - 1);
       const rangeStr = optionCount ? `A-${maxChar}` : 'A-D';
-      const prompt = `
-你是专业做题助手，请根据题目文本判断题型后给出答案。
+      const answerConf = this.answerConf();
+      const modelName = Store.getFeatureConf().answerProvider === 'deepseek' ? 'DeepSeek' : '千问';
+      if (image) {
+        panel.log(`正在让${modelName}复述截图中的题目...`);
+        const restated = this.stripReviewNoise(await this.requestChat(
+          '请逐字复述图片中的完整题目和所有选项。保留题干、选项字母和选项内容，按原来的换行。不要作答，不要解释。',
+          '你只负责把图片里的题目原样复述出来。',
+          answerConf,
+          1024,
+          [image]
+        ));
+        if (restated.replace(/\s/g, '').length < 8) throw new Error('模型没有复述出题目');
+        panel.showQuestion(restated);
+        panel.log('复述已写在上方题目卡片，8 秒后开始搜索并提交');
+        await Utils.sleep(8000);
+        const evidence = await this.searchQuestion(restated);
+        panel.log(evidence ? '正在根据复述和搜索结果作答...' : '没有搜到结果，改由模型根据复述作答...');
+        const prompt = `
+你是专业做题助手。下面题目是模型从截图复述的，搜索结果只在明确对应这道题时采用。
 强约束：
 1) 本题只有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}
-2) 按选项出现顺序映射 A/B/C/D...
+2) 按复述中选项出现顺序映射 A/B/C/D...
 3) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对/错
 题目内容：
+${restated}
+${evidence ? `搜索结果：\n${evidence}` : ''}
+`;
+        return this.requestChat(prompt, '你只输出答案。判断题输出对或错，选择题输出字母。搜索结果只在与本题一致时才采用。', answerConf);
+      }
+      panel.showQuestion(questionText);
+      panel.log('还原后的题目已写在上方卡片，8 秒后开始搜索并提交');
+      await Utils.sleep(8000);
+      const evidence = await this.searchQuestion(questionText);
+      const prompt = `
+你是专业做题助手。先看搜索结果是否就是这道题，再看页面上的选项。
+强约束：
+1) 搜索结果明确对应本题时，采用其中的答案；结果是别的题、互相矛盾或没有答案时，再根据题目判断
+2) 本题只有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}
+3) 按选项出现顺序映射 A/B/C/D...
+4) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对/错
+${evidence ? `搜索结果：\n${evidence}\n` : ''}题目内容：
 ${questionText}
 `;
-      return this.requestChat(prompt, "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。");
+      return this.requestChat(prompt, "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。搜索结果只在与本题一致时才采用。", answerConf);
     },
     async autoSelectAndSubmit(aiResponse, itemBodyElement) {
       const match = aiResponse.match(/(?:正确)?答案[：:]?\s*([A-F]+(?:[,，][A-F]+)*|[对错]|正确|错误)/i);
@@ -1423,6 +2119,7 @@ ${questionText}
       }
       if (!targetIndices.length) return;
       panel.log(`✅ AI 建议选：${answerRaw}`);
+      panel.noteAnswer(answerRaw);
 
       const listContainer = itemBodyElement.querySelector('.list-inline.list-unstyled-radio') ||
         itemBodyElement.querySelector('.list-unstyled.list-unstyled-radio') ||
@@ -1436,19 +2133,21 @@ ${questionText}
         panel.log('⚠️ 未找到选项容器');
         return;
       }
-      const options = listContainer.querySelectorAll('li, .option-item, .answer-item, [class*="option-item"], [class*="answer-item"]');
+      const rows = [...listContainer.querySelectorAll('li')].filter(node => node.querySelector('.el-radio, .el-checkbox, input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
+      const choices = rows.length >= 2
+        ? rows
+        : [...listContainer.querySelectorAll('.el-radio, .el-checkbox, [role="radio"], [role="checkbox"]')];
       for (const idx of targetIndices) {
-        if (!options[idx]) continue;
-        const clickable = options[idx].querySelector('label.el-radio') ||
-          options[idx].querySelector('label.el-checkbox') ||
-          options[idx].querySelector('.el-radio__label') ||
-          options[idx].querySelector('.el-checkbox__label') ||
-          options[idx].querySelector('[role="radio"]') ||
-          options[idx].querySelector('[role="checkbox"]') ||
-          options[idx].querySelector('input') ||
-          options[idx];
-        clickable.click();
-        await Utils.sleep(150);
+        if (!choices[idx]) continue;
+        const clickable = choices[idx].querySelector('label.el-radio') ||
+          choices[idx].querySelector('label.el-checkbox') ||
+          choices[idx].querySelector('.el-radio__label') ||
+          choices[idx].querySelector('.el-checkbox__label') ||
+          choices[idx].querySelector('[role="radio"]') ||
+          choices[idx].querySelector('[role="checkbox"]') ||
+          choices[idx].querySelector('input') ||
+          choices[idx];
+        await Utils.humanClick(clickable, 900, 2200);
       }
       const submitBtn = (() => {
         const ownerDocument = itemBodyElement.ownerDocument || document;
@@ -1468,7 +2167,7 @@ ${questionText}
       })();
       if (submitBtn) {
         panel.log('正在提交...');
-        submitBtn.click();
+        await Utils.humanClick(submitBtn, 1400, 3200);
       } else {
         panel.log('⚠️ 未找到提交按钮，请手动提交');
       }
@@ -1562,6 +2261,7 @@ ${questionText}
         console.log(`当前集数:${this.outside}/全部集数${list.length}`);
         if (this.outside >= list.length) {
           this.panel.log('课程刷完啦 🎉');
+          this.panel.track({ id: 'course-done', kind: 'course', title: '本课目录已全部结束', status: 'done', detail: '没有更多内容' });
           this.panel.resetStartButton('刷完啦~');
           Store.removeProgress(this.baseUrl);
           Store.clearPendingAutoStart();
@@ -1575,6 +2275,8 @@ ${questionText}
         }
         const type = course.querySelector('.tag')?.querySelector('use')?.getAttribute('xlink:href') || 'piliang';
         const title = course.querySelector('h2')?.innerText?.trim() || `第${this.outside + 1}项`;
+        const kind = type.includes('shipin') ? 'video' : type.includes('kejian') ? 'ppt' : type.includes('ketang') ? 'course' : 'course';
+        const stepId = `v2-${this.outside}`;
 
         // 预检查完成状态
         const statusBox = course.querySelector('.statistics-box .aside');
@@ -1585,11 +2287,13 @@ ${questionText}
 
         if (isCompleted) {
           this.panel.log(`✅ ${title} 已完成，跳过`);
+          this.panel.track({ id: stepId, kind, title, status: 'done', detail: '已完成' });
           this.updateProgress(this.outside + 1, 0);
           continue;
         }
 
         this.panel.log(`刷课状态：第 ${this.outside + 1}/${list.length} 个，类型 ${type}，标题：${title}`);
+        this.panel.track({ id: stepId, kind, title, status: 'doing', detail: `第 ${this.outside + 1}/${list.length} 个` });
         if (type.includes('shipin')) {
           await this.handleVideo(course);
         } else if (type.includes('piliang')) {
@@ -1618,11 +2322,12 @@ ${questionText}
     }
 
     async handleVideo(course) {
-      course.click();
+      await Utils.humanClick(course, 1000, 2200);
       if (await this.waitForExternalHandoff(1500)) return;
       await Utils.sleep(3000);
       const progressNode = document.querySelector('.progress-wrap')?.querySelector('.text');
       const title = document.querySelector('.title')?.innerText || '视频';
+      this.panel.track({ id: `v2-${this.outside}`, kind: 'video', title, status: 'doing' });
       const isDeadline = document.querySelector('.box')?.innerText.includes('已过考核截止时间');
       if (isDeadline) this.panel.log(`${title} 已过截止，进度不再增加，将直接跳过`);
       Player.applySpeed();
@@ -1635,6 +2340,7 @@ ${questionText}
       }, { interval: 5000, timeout: await Utils.getDDL() });
       stopObserve();
       if (!done) this.panel.log(`${title} 等待后仍未显示已完成，进入下一项`);
+      this.panel.track({ id: `v2-${this.outside}`, kind: 'video', title, status: 'done', detail: done ? '播放结束' : '未显示已完成，已继续' });
       this.updateProgress(this.outside + 1, 0);
       history.back();
       await Utils.sleep(1200);
@@ -1667,6 +2373,7 @@ ${questionText}
 
         if (isCompleted) {
           this.panel.log(`✅ ${title} 已完成，跳过`);
+          this.panel.track({ id: `v2-${this.outside}-${idx}`, kind: tagText === '音频' ? 'audio' : 'video', title, status: 'done', detail: '已完成' });
           idx++;
           this.updateProgress(this.outside, idx);
           continue;
@@ -1688,11 +2395,14 @@ ${questionText}
         if (this.shouldStop) return;
       }
       this.updateProgress(this.outside + 1, 0);
+      const batchTitle = course.querySelector('h2')?.innerText?.trim() || '批量内容';
+      this.panel.track({ id: `v2-${this.outside}`, kind: 'course', title: batchTitle, status: 'done', detail: '这一组已处理' });
       await Utils.sleep(1000);
     }
 
     async playAudioItem(item, title, idx) {
       this.panel.log(`开始播放音频：${title}`);
+      this.panel.track({ id: `v2-${this.outside}-${idx}`, kind: 'audio', title, status: 'doing' });
       item.click();
       if (await this.waitForExternalHandoff()) return idx;
       await Utils.sleep(2500);
@@ -1704,6 +2414,7 @@ ${questionText}
       }, { interval: 3000, timeout: await Utils.getDDL() });
       if (!done) this.panel.log(`${title} 等待后仍未显示已完成，进入下一项`);
       this.panel.log(`${title} 播放完成`);
+      this.panel.track({ id: `v2-${this.outside}-${idx}`, kind: 'audio', title, status: 'done', detail: done ? '播放结束' : '未显示已完成，已继续' });
       idx++;
       this.updateProgress(this.outside, idx);
       history.back();
@@ -1713,6 +2424,7 @@ ${questionText}
 
     async playVideoItem(item, title, idx) {
       this.panel.log(`开始播放视频：${title}`);
+      this.panel.track({ id: `v2-${this.outside}-${idx}`, kind: 'video', title, status: 'doing' });
       item.click();
       if (await this.waitForExternalHandoff()) return idx;
       await Utils.sleep(2500);
@@ -1728,6 +2440,7 @@ ${questionText}
       stopObserve();
       if (!done) this.panel.log(`${title} 等待后仍未显示已完成，进入下一项`);
       this.panel.log(`${title} 播放完成`);
+      this.panel.track({ id: `v2-${this.outside}-${idx}`, kind: 'video', title, status: 'done', detail: done ? '播放结束' : '未显示已完成，已继续' });
       idx++;
       this.updateProgress(this.outside, idx);
       history.back();
@@ -1808,8 +2521,8 @@ ${questionText}
         return idx;
       }
       this.panel.log('进入作业，读取题目并请求 AI');
-      item.click();
-      await Utils.sleep(1500);
+      await Utils.humanClick(item, 1200, 2600);
+      await Utils.humanPause(1500, 2800);
       let i = 0;
       const maxRetry = 3; // 最大重试次数
       while (true) {
@@ -1819,12 +2532,12 @@ ${questionText}
           break;
         }
         const listItem = items[i];
-        listItem.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        listItem.click();
-        await Utils.sleep(1800);
+        await Utils.humanClick(listItem, 1000, 2400);
+        await Utils.humanPause(1200, 2200);
         const disabled = document.querySelectorAll('.el-button.el-button--info.is-disabled.is-plain');
         if (disabled.length > 0) {
           this.panel.log(`第 ${i + 1} 题已完成，跳过...`);
+          this.panel.track({ id: `q-${this.outside}-${idx}-${i}`, kind: 'question', title: `第 ${i + 1} 题`, status: 'done', detail: '已完成，跳过' });
           i++;
           continue;
         }
@@ -1834,8 +2547,10 @@ ${questionText}
           targetEl?.querySelector('.list-unstyled.list-unstyled-radio') ||
           targetEl?.querySelector('ul.list');
         if (listContainer) optionCount = listContainer.querySelectorAll('li').length;
-        const questionText = await Solver.captureQuestion(targetEl);
-        if (questionText && questionText.length > 5) {
+        const captured = await Solver.captureQuestion(targetEl);
+        const questionText = captured?.text || '';
+        if (captured?.image || questionText.length > 5) {
+          this.panel.track({ id: `q-${this.outside}-${idx}-${i}`, kind: 'question', title: `第 ${i + 1} 题`, detail: questionText, status: 'doing' });
           let retryCount = 0;
           let success = false;
           while (retryCount < maxRetry && !success) {
@@ -1843,8 +2558,8 @@ ${questionText}
               if (retryCount > 0) {
                 this.panel.log(`🔄 第 ${i + 1} 题重试 ${retryCount}/${maxRetry}...`);
               }
-              panel.log('🤖 请求 AI 获取答案...');
-              const aiText = await Solver.askAI(questionText, optionCount);
+              panel.log('🤖 把题目截图发给模型...');
+              const aiText = await Solver.askAI(questionText, optionCount, captured.image);
               await Solver.autoSelectAndSubmit(aiText, targetEl);
               success = true;
             } catch (err) {
@@ -1859,19 +2574,19 @@ ${questionText}
             }
           }
         }
-        await Utils.sleep(1500);
+        await Utils.humanPause(2500, 5000);
         i++;
       }
       idx++;
       this.updateProgress(this.outside, idx);
       history.back();
-      await Utils.sleep(1200);
+      await Utils.humanPause(1500, 3000);
       return idx;
     }
 
     async handleClassroom(course) {
       this.panel.log('进入课堂模式...');
-      course.click();
+      await Utils.humanClick(course, 1000, 2200);
       await Utils.sleep(5000);
       const iframe = document.querySelector('iframe.lesson-report-mobile');
       if (!iframe || !iframe.contentDocument) {
@@ -1964,15 +2679,15 @@ ${questionText}
         this.updateProgress(this.outside + 1, 0);
         return;
       }
-      course.click();
-      await Utils.sleep(3000);
+      await Utils.humanClick(course, 1000, 2200);
+      await Utils.humanPause(2000, 3500);
 
       // 检测"查看课件"按钮（课件概况页专用）
       const checkBtn = document.querySelector('.ppt_img_box .check') || document.querySelector('p.check');
       if (checkBtn && checkBtn.innerText?.trim() === '查看课件') {
         this.panel.log('检测到"查看课件"按钮，正在点击...');
-        checkBtn.click();
-        await Utils.sleep(2000);
+        await Utils.humanClick(checkBtn, 900, 1800);
+        await Utils.humanPause(1500, 2800);
       }
       const classType = document.querySelector('.el-card__header')?.innerText || '';
       const className = document.querySelector('.dialog-header')?.firstElementChild?.innerText || '课件';
@@ -1980,9 +2695,9 @@ ${questionText}
         const slides = document.querySelector('.swiper-wrapper')?.children || [];
         this.panel.log(`开始播放 PPT：${className}`);
         for (let i = 0; i < slides.length; i++) {
-          slides[i].click();
+          await Utils.humanClick(slides[i], 700, 1600);
           this.panel.log(`${className}：第 ${i + 1} 张`);
-          await Utils.sleep(Config.pptInterval);
+          await Utils.humanPause(4500, 8000);
         }
         await Utils.sleep(Config.pptInterval);
         const videoBoxes = document.querySelectorAll('.video-box');
@@ -2203,7 +2918,9 @@ ${questionText}
 
     async handleMedia(route) {
       const title = AiWorkspace.getActiveLeafTitle() || `${route.type} ${route.leafId}`;
+      const stepId = `ai-${route.leafId || title}`;
       this.panel.log(`开始播放：${title}`);
+      this.panel.track({ id: stepId, kind: 'video', title, status: 'doing' });
       const ready = await Utils.poll(() => {
         const current = AiWorkspace.getMedia();
         if (!current || current.ended || current.seeking) return false;
@@ -2292,6 +3009,7 @@ ${questionText}
 
       await this.waitForMarked();
       this.panel.log(`${title} 播放完成`);
+      this.panel.track({ id: stepId, kind: 'video', title, status: 'done', detail: '播放结束' });
       return true;
     }
 
@@ -2329,20 +3047,29 @@ ${questionText}
         return false;
       }
 
-      const questionText = await Solver.captureQuestion(questionRoot);
-      if (!questionText || questionText.length <= 5) {
+      const captured = await Solver.captureQuestion(questionRoot);
+      const questionText = captured?.text || '';
+      if (!captured?.image && questionText.length <= 5) {
         this.panel.log(`${label || '当前题目'} 题目内容过短，跳过`);
         return false;
       }
+      const questionId = `q-${label || '题目'}-${Date.now()}`;
+      this.panel.track({
+        id: questionId,
+        kind: 'question',
+        title: label || '题目',
+        detail: questionText,
+        status: 'doing'
+      });
 
       const maxRetry = 3;
       for (let retryCount = 0; retryCount < maxRetry; retryCount++) {
         try {
           if (retryCount > 0) this.panel.log(`${label || '当前题目'} 重试 ${retryCount}/${maxRetry - 1}`);
-          this.panel.log('🤖 请求 AI 获取答案...');
-          const aiText = await Solver.askAI(questionText, optionCount);
+          this.panel.log('🤖 把题目截图发给模型...');
+          const aiText = await Solver.askAI(questionText, optionCount, captured.image);
           await Solver.autoSelectAndSubmit(aiText, questionRoot);
-          await Utils.sleep(1200);
+          await Utils.humanPause(2000, 4500);
           return true;
         } catch (err) {
           this.panel.log(`AI 答题失败：${err}`);
@@ -2356,7 +3083,7 @@ ${questionText}
       const currentRoot = AiWorkspace.getExerciseContainer() || root;
       const nextBtn = AiWorkspace.getExerciseActionButton(currentRoot, /下一题|下一道|下一步/);
       if (!nextBtn) return false;
-      nextBtn.click();
+      await Utils.humanClick(nextBtn, 1200, 2800);
       return Utils.poll(() => {
         const latestRoot = AiWorkspace.getExerciseContainer() || currentRoot;
         const questionRoot = AiWorkspace.getExerciseQuestionBody(latestRoot);
@@ -2419,6 +3146,7 @@ ${questionText}
         Store.clearPendingAutoStart();
         return;
       }
+      await Utils.humanPause(1500, 3500);
       this.source[count].firstChild.click();
       await Utils.sleep(2000);
       const switched = await Utils.poll(() => {

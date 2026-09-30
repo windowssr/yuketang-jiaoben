@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.20
+// @version      3.1.21
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -36,7 +36,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.20',    // 版本号
+    version: '3.1.21',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -90,7 +90,8 @@
         return 'waited';
       }
       this._humanSkipPending = true;
-      panel?.log('检测到人机验证，跳过当前章节，进入下一项');
+      panel?.log('检测到人机验证，先停留一会儿再进入下一项');
+      await this.humanPause(12000, 20000);
       return 'skip';
     },
     async waitIfHumanCheck() {
@@ -1297,7 +1298,7 @@
   // ---- 播放器工具 ----
   const mediaDurationState = new WeakMap();
   const Player = {
-    RESUME_DELAY: 3000,
+    RESUME_DELAY: 15000,
     DURATION_STABLE_TICKS: 3,
     noteDuration(media) {
       if (!media) return false;
@@ -1389,23 +1390,23 @@
         if (Utils.isHumanCheckVisible()) return false;
         return shouldResume() && this.isReadyToPlay(video) && !this.isNearEnd(video, 0.2);
       };
-      // 自动播放。缓冲或换集时先别 play，等数据够了再继续，避免跳到下一个关键帧
+      let resumeTimer = null;
+      let lastPlayAt = 0;
       const playVideo = () => {
         if (!canResume()) return;
+        if (Date.now() - lastPlayAt < this.RESUME_DELAY) return;
+        lastPlayAt = Date.now();
         video.play().catch(e => {
           if (!canResume()) return;
           console.warn('自动播放失败:', e);
-          setTimeout(playVideo, 3000);
         });
       };
-      let resumeTimer = null;
       const scheduleResume = () => {
         if (resumeTimer) return;
         const pausedAtTime = Number(video.currentTime || 0);
         resumeTimer = setTimeout(() => {
           resumeTimer = null;
           if (!video.paused || !canResume()) return;
-          // 暂停期间进度已经往前走，说明播放器自己在跳，不要再 play
           if (Math.abs(Number(video.currentTime || 0) - pausedAtTime) > 0.5) return;
           playVideo();
         }, this.RESUME_DELAY);
@@ -1413,8 +1414,7 @@
       if (video.paused) scheduleResume();
       const onPause = () => { if (canResume()) scheduleResume(); };
       video.addEventListener('pause', onPause);
-      const timer = setInterval(() => { if (video.paused && canResume()) scheduleResume(); }, 5000);
-      // 播放器 UI 观察：按钮被点击暂停时 tip 变为「播放」
+      const timer = setInterval(() => { if (video.paused && canResume()) scheduleResume(); }, 20000);
       const target = document.getElementsByClassName('play-btn-tip')[0];
       let observer = null;
       if (target) {
@@ -1563,10 +1563,11 @@
           return;
         }
         if (Date.now() - pausedAt >= Player.RESUME_DELAY) {
+          pausedAt = Date.now();
           media.play().catch(() => { });
         }
       };
-      const timer = setInterval(tick, 500);
+      const timer = setInterval(tick, 8000);
       document.addEventListener('visibilitychange', tick);
       window.addEventListener('focus', tick);
       tick();
@@ -1756,26 +1757,8 @@
     }
   };
 
-  // ---- 防切屏 ----
-  function preventScreenCheck() {
-    const win = unsafeWindow;
-    const blackList = new Set(['visibilitychange', 'blur', 'pagehide']);
-    win._addEventListener = win.addEventListener;
-    win.addEventListener = (...args) => blackList.has(args[0]) ? undefined : win._addEventListener(...args);
-    document._addEventListener = document.addEventListener;
-    document.addEventListener = (...args) => blackList.has(args[0]) ? undefined : document._addEventListener(...args);
-    Object.defineProperties(document, {
-      hidden: { value: false },
-      visibilityState: { value: 'visible' },
-      hasFocus: { value: () => true },
-      onvisibilitychange: { get: () => undefined, set: () => { } },
-      onblur: { get: () => undefined, set: () => { } }
-    });
-    Object.defineProperties(win, {
-      onblur: { get: () => undefined, set: () => { } },
-      onpagehide: { get: () => undefined, set: () => { } }
-    });
-  }
+  // 不再改写页面可见性和 addEventListener。改写这些接口本身就会被当成脚本。
+  function preventScreenCheck() { }
 
   // ---- OCR & AI ----
   const Solver = {
@@ -2930,11 +2913,7 @@ ${questionText}
         Store.setProClassCount(classCount);
         const nextBtn = document.querySelector('.btn-next');
         if (nextBtn) {
-          const event1 = new Event('mousemove', { bubbles: true });
-          event1.clientX = 9999;
-          event1.clientY = 9999;
-          nextBtn.dispatchEvent(event1);
-          nextBtn.dispatchEvent(new Event('click'));
+          await Utils.humanClick(nextBtn, 1200, 2600);
         } else {
           localStorage.removeItem(Config.storageKeys.proClassCount);
           this.panel.log('课程播放完毕 🎉');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.21
+// @version      3.1.22
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -36,7 +36,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.21',    // 版本号
+    version: '3.1.22',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -2135,9 +2135,48 @@
         return 'OCR识别出错';
       }
     },
-    async askAI(questionText, optionCount = 0, image = '') {
-      const maxChar = String.fromCharCode(65 + optionCount - 1);
+    questionChoices(itemBodyElement) {
+      if (!itemBodyElement) return [];
+      const listContainer = itemBodyElement.querySelector('.list-inline.list-unstyled-radio') ||
+        itemBodyElement.querySelector('.list-unstyled.list-unstyled-radio') ||
+        itemBodyElement.querySelector('.list-unstyled') ||
+        itemBodyElement.querySelector('ul.list') ||
+        itemBodyElement.querySelector('[class*="option-list"]') ||
+        itemBodyElement.querySelector('[class*="answer-list"]') ||
+        itemBodyElement.querySelector('ul') ||
+        itemBodyElement.querySelector('[role="radiogroup"]');
+      if (!listContainer) return [];
+      const rows = [...listContainer.querySelectorAll('li')].filter(node => node.querySelector('.el-radio, .el-checkbox, input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
+      if (rows.length >= 2) return rows;
+      return [...listContainer.querySelectorAll('.el-radio, .el-checkbox, [role="radio"], [role="checkbox"]')];
+    },
+    detectQuestionType(itemBodyElement) {
+      const choices = this.questionChoices(itemBodyElement);
+      const hasCheckbox = choices.some(choice => choice.matches('.el-checkbox, [role="checkbox"]') || choice.querySelector('.el-checkbox, input[type="checkbox"], [role="checkbox"]'));
+      const labels = choices.map(choice => (choice.innerText || '').replace(/\s+/g, ''));
+      const polarity = text => {
+        if (/不正确|不对|错误|错|否|False/i.test(text)) return 'false';
+        if (/正确|对|是|True/i.test(text)) return 'true';
+        return '';
+      };
+      const judgeLabels = labels.map(polarity).filter(Boolean);
+      if (!hasCheckbox && labels.length === 2 && judgeLabels.length === 2 && judgeLabels[0] !== judgeLabels[1]) return 'judge';
+      if (hasCheckbox) return 'multiple';
+      return 'single';
+    },
+    questionTypeName(questionType) {
+      if (questionType === 'multiple') return '多选题';
+      if (questionType === 'judge') return '判断题';
+      return '单选题';
+    },
+    questionTypeRule(questionType, optionCount) {
+      const maxChar = String.fromCharCode(65 + Math.max(optionCount, 1) - 1);
       const rangeStr = optionCount ? `A-${maxChar}` : 'A-D';
+      if (questionType === 'multiple') return `这是多选题，有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}。选出所有正确答案，字母连写，例如 ABD。`;
+      if (questionType === 'judge') return '这是判断题。只能输出“对”或“错”，不要输出字母。';
+      return `这是单选题，有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}。只能选择一个选项，正确答案只能有一个字母。`;
+    },
+    async askAI(questionText, optionCount = 0, image = '', questionType = 'single') {
       const answerConf = this.answerConf();
       const modelName = Store.getFeatureConf().answerProvider === 'deepseek' ? 'DeepSeek' : '千问';
       if (image) {
@@ -2158,9 +2197,9 @@
         const prompt = `
 你是专业做题助手。下面题目是模型从截图复述的，搜索结果只在明确对应这道题时采用。
 强约束：
-1) 本题只有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}
+1) ${this.questionTypeRule(questionType, optionCount)}
 2) 按复述中选项出现顺序映射 A/B/C/D...
-3) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对/错
+3) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对
 题目内容：
 ${restated}
 ${evidence ? `搜索结果：\n${evidence}` : ''}
@@ -2175,15 +2214,15 @@ ${evidence ? `搜索结果：\n${evidence}` : ''}
 你是专业做题助手。先看搜索结果是否就是这道题，再看页面上的选项。
 强约束：
 1) 搜索结果明确对应本题时，采用其中的答案；结果是别的题、互相矛盾或没有答案时，再根据题目判断
-2) 本题只有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}
+2) ${this.questionTypeRule(questionType, optionCount)}
 3) 按选项出现顺序映射 A/B/C/D...
-4) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对/错
+4) 输出格式必须包含“正确答案：”前缀，例如 正确答案：A 或 正确答案：ABD 或 正确答案：对
 ${evidence ? `搜索结果：\n${evidence}\n` : ''}题目内容：
 ${questionText}
 `;
       return this.requestChat(prompt, "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。搜索结果只在与本题一致时才采用。", answerConf);
     },
-    async autoSelectAndSubmit(aiResponse, itemBodyElement) {
+    async autoSelectAndSubmit(aiResponse, itemBodyElement, questionType = 'single') {
       const match = aiResponse.match(/(?:正确)?答案[：:]?\s*([A-F]+(?:[,，][A-F]+)*|[对错]|正确|错误)/i);
       if (!match) {
         panel.log('⚠️ 未提取到有效选项，请人工检查');
@@ -2191,46 +2230,49 @@ ${questionText}
       }
       let answerRaw = match[1].replace(/[,，]/g, '').trim();
       const map = { 'A': 0, 'B': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5 };
+      const choices = this.questionChoices(itemBodyElement);
+      if (choices.length < 2) {
+        panel.log('⚠️ 未找到选项容器');
+        return;
+      }
+      const polarity = text => {
+        const compact = String(text || '').replace(/\s+/g, '');
+        if (/不正确|不对|错误|错|否|False/i.test(compact)) return 'false';
+        if (/正确|对|是|True/i.test(compact)) return 'true';
+        return '';
+      };
       let targetIndices = [];
-      if (answerRaw === '对' || answerRaw === '正确') {
-        targetIndices = [0];
-      } else if (answerRaw === '错' || answerRaw === '错误') {
-        targetIndices = [1];
+      if (questionType === 'judge') {
+        const upper = answerRaw.toUpperCase();
+        const want = (answerRaw === '错' || answerRaw === '错误' || upper === 'B') ? 'false'
+          : (answerRaw === '对' || answerRaw === '正确' || upper === 'A') ? 'true' : '';
+        const found = want ? choices.findIndex(choice => polarity(choice.innerText) === want) : -1;
+        targetIndices = [found >= 0 ? found : (want === 'false' ? 1 : 0)];
+        answerRaw = want === 'false' ? '错' : '对';
       } else {
         for (const char of answerRaw.toUpperCase()) {
           if (map[char] !== undefined) targetIndices.push(map[char]);
         }
+        if (questionType === 'single') targetIndices = targetIndices.slice(0, 1);
       }
+      targetIndices = [...new Set(targetIndices)].filter(idx => idx < choices.length);
       if (!targetIndices.length) return;
-      panel.log(`✅ AI 建议选：${answerRaw}`);
+      panel.log(`✅ ${this.questionTypeName(questionType)}，选择：${answerRaw}`);
       panel.noteAnswer(answerRaw);
 
-      const listContainer = itemBodyElement.querySelector('.list-inline.list-unstyled-radio') ||
-        itemBodyElement.querySelector('.list-unstyled.list-unstyled-radio') ||
-        itemBodyElement.querySelector('.list-unstyled') ||
-        itemBodyElement.querySelector('ul.list') ||
-        itemBodyElement.querySelector('[class*="option-list"]') ||
-        itemBodyElement.querySelector('[class*="answer-list"]') ||
-        itemBodyElement.querySelector('ul') ||
-        itemBodyElement.querySelector('[role="radiogroup"]');
-      if (!listContainer) {
-        panel.log('⚠️ 未找到选项容器');
-        return;
-      }
-      const rows = [...listContainer.querySelectorAll('li')].filter(node => node.querySelector('.el-radio, .el-checkbox, input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
-      const choices = rows.length >= 2
-        ? rows
-        : [...listContainer.querySelectorAll('.el-radio, .el-checkbox, [role="radio"], [role="checkbox"]')];
       for (const idx of targetIndices) {
-        if (!choices[idx]) continue;
-        const clickable = choices[idx].querySelector('label.el-radio') ||
-          choices[idx].querySelector('label.el-checkbox') ||
-          choices[idx].querySelector('.el-radio__label') ||
-          choices[idx].querySelector('.el-checkbox__label') ||
-          choices[idx].querySelector('[role="radio"]') ||
-          choices[idx].querySelector('[role="checkbox"]') ||
-          choices[idx].querySelector('input') ||
-          choices[idx];
+        const choice = choices[idx];
+        if (!choice) continue;
+        const chosen = choice.classList.contains('is-checked') || choice.querySelector('.is-checked, input:checked');
+        if (chosen) continue;
+        const clickable = choice.querySelector('label.el-radio') ||
+          choice.querySelector('label.el-checkbox') ||
+          choice.querySelector('.el-radio__label') ||
+          choice.querySelector('.el-checkbox__label') ||
+          choice.querySelector('[role="radio"]') ||
+          choice.querySelector('[role="checkbox"]') ||
+          choice.querySelector('input') ||
+          choice;
         await Utils.humanClick(clickable, 900, 2200);
       }
       const submitBtn = (() => {
@@ -2609,28 +2651,33 @@ ${questionText}
       await Utils.humanPause(1500, 2800);
       let i = 0;
       const maxRetry = 3; // 最大重试次数
-      while (true) {
+      while (i < 40) {
         const items = document.querySelectorAll('.subject-item.J_order');
-        if (i >= items.length) {
-          this.panel.log(`所有题目处理完毕，共 ${items.length} 题，准备交卷`);
-          break;
-        }
-        const listItem = items[i];
-        await Utils.humanClick(listItem, 1000, 2400);
-        await Utils.humanPause(1200, 2200);
+        const targetEl = document.querySelector('.item-type')?.parentElement || document.querySelector('.item-body');
         const disabled = document.querySelectorAll('.el-button.el-button--info.is-disabled.is-plain');
-        if (disabled.length > 0) {
-          this.panel.log(`第 ${i + 1} 题已完成，跳过...`);
-          this.panel.track({ id: `q-${this.outside}-${idx}-${i}`, kind: 'question', title: `第 ${i + 1} 题`, status: 'done', detail: '已完成，跳过' });
+        if (!targetEl || disabled.length > 0) {
+          this.panel.log(`第 ${i + 1} 题已完成，等页面自己进入下一题`);
+          const before = (targetEl?.innerText || '').slice(0, 80);
+          const moved = await Utils.poll(() => {
+            const now = (document.querySelector('.item-body')?.innerText || '').slice(0, 80);
+            return now && now !== before;
+          }, { interval: 500, timeout: 4000 });
+          if (moved) {
+            i++;
+            continue;
+          }
+          const nextItem = items[i + 1];
+          if (!nextItem) {
+            this.panel.log(`所有题目处理完毕，共 ${items.length} 题，准备交卷`);
+            break;
+          }
+          await Utils.humanClick(nextItem, 1000, 2400);
+          await Utils.humanPause(1200, 2200);
           i++;
           continue;
         }
-        const targetEl = document.querySelector('.item-type')?.parentElement || document.querySelector('.item-body');
-        let optionCount = 0;
-        const listContainer = targetEl?.querySelector('.list-inline.list-unstyled-radio') ||
-          targetEl?.querySelector('.list-unstyled.list-unstyled-radio') ||
-          targetEl?.querySelector('ul.list');
-        if (listContainer) optionCount = listContainer.querySelectorAll('li').length;
+        const questionType = Solver.detectQuestionType(targetEl);
+        const optionCount = Solver.questionChoices(targetEl).length;
         const captured = await Solver.captureQuestion(targetEl);
         const questionText = captured?.text || '';
         if (captured?.image || questionText.length > 5) {
@@ -2642,10 +2689,15 @@ ${questionText}
               if (retryCount > 0) {
                 this.panel.log(`🔄 第 ${i + 1} 题重试 ${retryCount}/${maxRetry}...`);
               }
-              panel.log('🤖 把题目截图发给模型...');
-              const aiText = await Solver.askAI(questionText, optionCount, captured.image);
-              await Solver.autoSelectAndSubmit(aiText, targetEl);
+              this.panel.log(`当前是${Solver.questionTypeName(questionType)}`);
+              const aiText = await Solver.askAI(questionText, optionCount, captured.image, questionType);
+              const before = (targetEl.innerText || '').slice(0, 80);
+              await Solver.autoSelectAndSubmit(aiText, targetEl, questionType);
               success = true;
+              await Utils.poll(() => {
+                const now = (document.querySelector('.item-body')?.innerText || '').slice(0, 80);
+                return now && now !== before;
+              }, { interval: 500, timeout: 8000 });
             } catch (err) {
               retryCount++;
               this.panel.log(`AI 答题失败：${err}`);
@@ -3115,17 +3167,9 @@ ${questionText}
         return true;
       }
 
-      const listContainer = questionRoot.querySelector('.list-inline.list-unstyled-radio')
-        || questionRoot.querySelector('.list-unstyled.list-unstyled-radio')
-        || questionRoot.querySelector('.list-unstyled')
-        || questionRoot.querySelector('ul.list')
-        || questionRoot.querySelector('[class*="option-list"]')
-        || questionRoot.querySelector('[class*="answer-list"]')
-        || questionRoot.querySelector('ul')
-        || questionRoot.querySelector('[role="radiogroup"]');
-      const optionCount = listContainer
-        ? listContainer.querySelectorAll('li, .option-item, .answer-item, [class*="option-item"], [class*="answer-item"]').length
-        : 0;
+      const choices = Solver.questionChoices(questionRoot);
+      const optionCount = choices.length;
+      const questionType = Solver.detectQuestionType(questionRoot);
       if (!optionCount) {
         this.panel.log(`${label || '当前题目'} 未找到选项，跳过`);
         return false;
@@ -3150,9 +3194,9 @@ ${questionText}
       for (let retryCount = 0; retryCount < maxRetry; retryCount++) {
         try {
           if (retryCount > 0) this.panel.log(`${label || '当前题目'} 重试 ${retryCount}/${maxRetry - 1}`);
-          this.panel.log('🤖 把题目截图发给模型...');
-          const aiText = await Solver.askAI(questionText, optionCount, captured.image);
-          await Solver.autoSelectAndSubmit(aiText, questionRoot);
+          this.panel.log(`当前是${Solver.questionTypeName(questionType)}`);
+          const aiText = await Solver.askAI(questionText, optionCount, captured.image, questionType);
+          await Solver.autoSelectAndSubmit(aiText, questionRoot, questionType);
           await Utils.humanPause(2000, 4500);
           return true;
         } catch (err) {
@@ -3191,32 +3235,28 @@ ${questionText}
       }
 
       this.panel.log(`开始处理作业：${AiWorkspace.getActiveLeafTitle() || route.leafId}`);
-      const tabs = AiWorkspace.getExerciseQuestionTabs(root);
-      if (tabs.length) {
-        this.panel.log(`检测到题目索引 ${tabs.length} 个，按题号顺序作答`);
-        for (let i = 0; i < tabs.length; i++) {
-          const currentRoot = AiWorkspace.getExerciseContainer() || root;
-          const currentTabs = AiWorkspace.getExerciseQuestionTabs(currentRoot);
-          const currentTab = currentTabs[i];
-          if (!currentTab) break;
-          currentTab.click();
-          await Utils.sleep(1200);
-          await this.solveExerciseQuestion(AiWorkspace.getExerciseContainer() || currentRoot, `第 ${i + 1} 题`);
-        }
-        return true;
-      }
-
-      this.panel.log('未找到题号列表，尝试只处理当前题并按下一题推进');
       let previousFingerprint = '';
-      for (let i = 0; i < 20; i++) {
+      for (let i = 0; i < 40; i++) {
         const currentRoot = AiWorkspace.getExerciseContainer() || root;
         const questionRoot = AiWorkspace.getExerciseQuestionBody(currentRoot);
         const fingerprint = AiWorkspace.normalizeText(questionRoot?.innerText || '').slice(0, 120);
         if (!fingerprint) break;
+        if (AiWorkspace.isExerciseAnswered(questionRoot)) {
+          const tabs = AiWorkspace.getExerciseQuestionTabs(currentRoot);
+          const pending = tabs.find(tab => !/active|current|selected|is-active/.test(tab.className));
+          if (!pending) break;
+          await Utils.humanClick(pending, 800, 1600);
+          await Utils.sleep(1000);
+          continue;
+        }
         if (i > 0 && fingerprint === previousFingerprint) break;
-        await this.solveExerciseQuestion(currentRoot, this.getExerciseQuestionLabel(currentRoot) || `第 ${i + 1} 题`);
+        await this.solveExerciseQuestion(currentRoot, `第 ${i + 1} 题`);
         previousFingerprint = fingerprint;
-        const moved = await this.advanceExerciseQuestion(currentRoot, fingerprint);
+        const moved = await Utils.poll(() => {
+          const latestRoot = AiWorkspace.getExerciseQuestionBody(AiWorkspace.getExerciseContainer() || currentRoot);
+          const nextFingerprint = AiWorkspace.normalizeText(latestRoot?.innerText || '').slice(0, 120);
+          return nextFingerprint && nextFingerprint !== fingerprint;
+        }, { interval: 500, timeout: 8000 });
         if (!moved) break;
       }
       return true;

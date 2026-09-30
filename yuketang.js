@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.18
+// @version      3.1.20
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -36,7 +36,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.18',    // 版本号
+    version: '3.1.20',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -70,14 +70,35 @@
       }
       return false;
     },
+    humanCheckMode() {
+      return Store.getFeatureConf().humanCheckMode === 'wait' ? 'wait' : 'skip';
+    },
+    async gateHumanCheck() {
+      if (!this.isHumanCheckVisible()) {
+        this._humanSkipPending = false;
+        return 'ok';
+      }
+      const waitHere = this.humanCheckMode() === 'wait' || this._humanSkipPending;
+      if (waitHere) {
+        panel?.log(this._humanSkipPending
+          ? '验证窗口还在，先停下，避免把后面的章节一并跳过。关掉窗口后会继续'
+          : '检测到人机验证，已停在当前章节，请手动完成后继续');
+        while (this.isHumanCheckVisible()) await this.sleep(1000);
+        const skippedOnce = this._humanSkipPending;
+        this._humanSkipPending = false;
+        panel?.log(skippedOnce ? '验证窗口已关闭，继续下一项' : '人机验证已完成，继续当前章节');
+        return 'waited';
+      }
+      this._humanSkipPending = true;
+      panel?.log('检测到人机验证，跳过当前章节，进入下一项');
+      return 'skip';
+    },
     async waitIfHumanCheck() {
-      if (!this.isHumanCheckVisible()) return;
-      panel?.log('检测到人机验证，请手动完成，完成后脚本会继续');
-      await this.poll(() => !this.isHumanCheckVisible(), { interval: 1000, timeout: 180000 });
+      return (await this.gateHumanCheck()) !== 'skip';
     },
     async humanClick(element, min = 800, max = 2000) {
       if (!element) return;
-      await this.waitIfHumanCheck();
+      if (!await this.waitIfHumanCheck()) return;
       try {
         element.scrollIntoView({ behavior: 'smooth', block: 'center' });
       } catch (_) {}
@@ -93,21 +114,20 @@
       }
     },
     // 每隔一段时间检查某个条件是否满足（通过 checker 函数），如果满足就成功返回；如果超时仍未满足，就失败返回
-    poll(checker, { interval = 1000, timeout = 20000 } = {}) {
-      return new Promise(resolve => {
-        const start = Date.now();
-        const timer = setInterval(() => {
-          if (checker()) {
-            clearInterval(timer);
-            resolve(true);
-            return;
-          }
-          if (Date.now() - start > timeout) {
-            clearInterval(timer);
-            resolve(false);
-          }
-        }, interval);
-      });
+    async poll(checker, { interval = 1000, timeout = 20000 } = {}) {
+      let spent = 0;
+      while (spent <= timeout) {
+        const gateStarted = Date.now();
+        const gate = await this.gateHumanCheck();
+        const gateCost = Date.now() - gateStarted;
+        if (gate === 'skip') return false;
+        if (checker()) return true;
+        const pauseStarted = Date.now();
+        await this.sleep(interval);
+        const pauseCost = Date.now() - pauseStarted;
+        spent += (gate === 'waited' ? 0 : gateCost) + pauseCost;
+      }
+      return false;
     },
     // 使用UI课程完成度来判别是否完成课程
     isProgressDone(text) {
@@ -296,6 +316,7 @@
         autoAI: saved.autoAI ?? false,
         autoComment: saved.autoComment ?? false,
         answerProvider: saved.answerProvider === 'deepseek' ? 'deepseek' : 'qwen',
+        humanCheckMode: saved.humanCheckMode === 'wait' ? 'wait' : 'skip',
       };
       localStorage.setItem(Config.storageKeys.feature, JSON.stringify(conf));
       return conf;
@@ -653,6 +674,18 @@
               .choice input {
                 margin: 0;
               }
+              .choice-stack {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                margin-bottom: 8px;
+              }
+              .choice.choice-block {
+                flex: none;
+                justify-content: flex-start;
+                line-height: 1.45;
+                padding: 12px 14px;
+              }
 
               /* 表单项 */
               .form-item {
@@ -851,6 +884,14 @@
                   </div>
                 </div>
                 <div class="settings-card">
+                  <div class="card-title">人机验证</div>
+                  <p class="card-hint">弹出验证时怎么处理。默认是跳过当前章节。</p>
+                  <div class="choice-stack">
+                    <label class="choice choice-block"><input type="radio" name="human_check_mode" value="skip"> 跳过当前章节，进入下一章</label>
+                    <label class="choice choice-block"><input type="radio" name="human_check_mode" value="wait"> 停在这里，等我手动验证后再继续</label>
+                  </div>
+                </div>
+                <div class="settings-card">
                   <div class="card-title">开关</div>
                   <div class="form-item">
                     <label class="checkbox-label">
@@ -983,7 +1024,7 @@
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     }[ch]));
     const kindText = {
-      video: '视频', audio: '音频', ppt: '课件', course: '课程', question: '题目', homework: '作业'
+      video: '视频', audio: '音频', ppt: '课件', course: '课程', question: '题目', homework: '作业', forum: '讨论'
     };
     const stateText = { doing: '进行中', done: '已结束', skip: '已跳过' };
     const renderTrail = trail => {
@@ -1111,6 +1152,9 @@
       const provider = saved.answerProvider === 'deepseek' ? 'deepseek' : 'qwen';
       const picked = doc.querySelector(`input[name="answer_provider"][value="${provider}"]`);
       if (picked) picked.checked = true;
+      const humanMode = saved.humanCheckMode === 'wait' ? 'wait' : 'skip';
+      const humanPicked = doc.querySelector(`input[name="human_check_mode"][value="${humanMode}"]`);
+      if (humanPicked) humanPicked.checked = true;
       syncProviderCards();
     };
     const syncProviderCards = () => {
@@ -1182,11 +1226,13 @@
       const featureConf = {
         autoAI: ui.featureAutoAI.checked,
         autoComment: ui.featureAutoComment.checked,
-        answerProvider: doc.querySelector('input[name="answer_provider"]:checked')?.value === 'deepseek' ? 'deepseek' : 'qwen'
+        answerProvider: doc.querySelector('input[name="answer_provider"]:checked')?.value === 'deepseek' ? 'deepseek' : 'qwen',
+        humanCheckMode: doc.querySelector('input[name="human_check_mode"]:checked')?.value === 'wait' ? 'wait' : 'skip'
       };
       Store.setFeatureConf(featureConf);
       ui.settings.style.display = 'none';
-      log('✅ AI 配置已保存');
+      const humanText = featureConf.humanCheckMode === 'wait' ? '人机验证改为停住等待' : '人机验证改为跳过当前章节';
+      log(`✅ AI 配置已保存，${humanText}`);
     };
 
     ui.btnClear.onclick = () => {
@@ -1340,6 +1386,7 @@
       if (!video) return () => { };
       const canResume = () => {
         this.noteDuration(video);
+        if (Utils.isHumanCheckVisible()) return false;
         return shouldResume() && this.isReadyToPlay(video) && !this.isNearEnd(video, 0.2);
       };
       // 自动播放。缓冲或换集时先别 play，等数据够了再继续，避免跳到下一个关键帧
@@ -1474,7 +1521,7 @@
       let pausedAt = 0;
       let pausedMark = 0;
       const tick = () => {
-        if (!shouldResume()) return;
+        if (!shouldResume() || Utils.isHumanCheckVisible()) return;
         const media = this.getMedia();
         if (!media) return;
         if (lastMedia !== media) {
@@ -1604,6 +1651,60 @@
         if (match) return match;
       }
       return root;
+    },
+    forumStatus() {
+      const nodes = [...document.querySelectorAll('span, div, em, strong, p')];
+      for (const el of nodes) {
+        if (!this.isVisibleElement(el)) continue;
+        const text = (el.innerText || '').trim();
+        if (text === '未发言' || text === '已发言' || text === '已完成') return text;
+      }
+      return '';
+    },
+    forumTopic() {
+      const hits = [];
+      for (const el of document.querySelectorAll('body *')) {
+        if (!this.isVisibleElement(el)) continue;
+        if (el.querySelector('textarea, [contenteditable="true"]')) continue;
+        const text = this.normalizeText(el.innerText);
+        if (text.length < 10 || text.length > 240) continue;
+        if (!/[？?]/.test(text)) continue;
+        if (/发表你的观点|Enter发送|未发言|已发言|讨论区/.test(text)) continue;
+        const sameChild = [...el.children].some(child => this.normalizeText(child.innerText) === text);
+        if (sameChild) continue;
+        hits.push({ text, top: el.getBoundingClientRect().top });
+      }
+      hits.sort((a, b) => a.top - b.top || a.text.length - b.text.length);
+      return hits[0]?.text || '';
+    },
+    findForumComposer() {
+      const fields = [...document.querySelectorAll('textarea, [contenteditable="true"]')].filter(el => this.isVisibleElement(el));
+      const hinted = fields.find(el => /发表你的观点|观点|评论|讨论/.test(`${el.getAttribute('placeholder') || ''} ${el.getAttribute('data-placeholder') || ''} ${el.getAttribute('aria-placeholder') || ''}`));
+      return hinted || fields[0] || null;
+    },
+    findForumSendButton(composer) {
+      const hint = [...document.querySelectorAll('span, div, p')].find(el => this.isVisibleElement(el) && (el.innerText || '').includes('Enter发送'));
+      const row = hint?.parentElement;
+      const rowButtons = row ? [...row.querySelectorAll('button, [role="button"]')].filter(el => this.isVisibleElement(el)) : [];
+      if (rowButtons.length) return rowButtons[rowButtons.length - 1];
+      const scope = composer?.closest('form, section, article') || document;
+      const labeled = [...scope.querySelectorAll('button, [role="button"]')].find(el => this.isVisibleElement(el) && /发送|发布/.test(el.innerText || ''));
+      return labeled || null;
+    },
+    setFieldValue(el, text) {
+      if (!el) return;
+      el.focus();
+      if (el.isContentEditable) {
+        el.innerText = text;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+        return;
+      }
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(el, text);
+      else el.value = text;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
     },
     isExerciseAnswered(root = this.getExerciseContainer()) {
       if (!root) return false;
@@ -2957,6 +3058,10 @@ ${questionText}
           return currentTime > startTime + 0.5 || (!media.paused && media.readyState >= 2 && currentTime > startTime + 0.2);
         }, { interval: 500, timeout: 15000 });
         if (!started) {
+          if (Utils.humanCheckMode() === 'skip' && Utils.isHumanCheckVisible()) {
+            this.panel.log('检测到人机验证，跳过本节并进入下一项');
+            return true;
+          }
           this.panel.log('未确认到视频实际开始播放，停止当前轮次');
           return false;
         }
@@ -3138,6 +3243,93 @@ ${questionText}
       return true;
     }
 
+    async handleForum(route) {
+      const title = AiWorkspace.getActiveLeafTitle() || '讨论';
+      const stepId = `forum-${route.leafId || title}`;
+      this.panel.log(`开始处理讨论：${title}`);
+      this.panel.track({ id: stepId, kind: 'forum', title, status: 'doing', detail: '读取讨论题' });
+      await Utils.poll(() => AiWorkspace.forumStatus() || AiWorkspace.forumTopic() || AiWorkspace.findForumComposer(), { interval: 500, timeout: 12000 });
+      const status = AiWorkspace.forumStatus();
+      if (status === '已发言' || status === '已完成') {
+        this.panel.log(`${title} 已经发过言，跳过`);
+        this.panel.track({ id: stepId, kind: 'forum', title, status: 'done', detail: status });
+        return true;
+      }
+      if (!Store.getFeatureConf().autoComment) {
+        this.panel.log('未开启「批量区图文和讨论自动回复」，讨论已跳过。要自动发言请在 AI 配置里打开这个开关');
+        this.panel.track({ id: stepId, kind: 'forum', title, status: 'skip', detail: '未开启自动回复' });
+        return true;
+      }
+      let composer = AiWorkspace.findForumComposer();
+      if (!composer) {
+        const tab = [...document.querySelectorAll('button, [role="tab"], a, span, div')].find(el => {
+          const text = (el.innerText || '').trim();
+          return /^讨论区/.test(text) && text.length < 16 && AiWorkspace.isVisibleElement(el);
+        });
+        if (tab) {
+          tab.click();
+          await Utils.sleep(800);
+          composer = AiWorkspace.findForumComposer();
+        }
+      }
+      const topic = AiWorkspace.forumTopic();
+      if (!topic) {
+        this.panel.log('没有读到讨论题，跳过');
+        this.panel.track({ id: stepId, kind: 'forum', title, status: 'skip', detail: '没有读到题目' });
+        return true;
+      }
+      if (!composer) {
+        this.panel.log('没有找到发言框，跳过');
+        this.panel.track({ id: stepId, kind: 'forum', title, status: 'skip', detail: '没有发言框' });
+        return true;
+      }
+      this.panel.track({ id: stepId, kind: 'forum', title, status: 'doing', detail: topic });
+      this.panel.log('正在根据讨论题写回复...');
+      let reply = '';
+      try {
+        reply = await Solver.requestChat(
+          `请根据讨论题写一条学生回复。用第一人称，80到140个字，直接回答题目里的问题。不要标题，不要序号，不要引号，不要说自己是模型。\n讨论题：\n${topic}`,
+          '你是在课程讨论区发言的大学生，只输出回复正文。',
+          Solver.answerConf(),
+          256
+        );
+      } catch (err) {
+        this.panel.log(`讨论回复生成失败：${err.message || err}`);
+        this.panel.track({ id: stepId, kind: 'forum', title, status: 'skip', detail: '回复生成失败' });
+        return true;
+      }
+      reply = String(reply || '').replace(/```[\s\S]*?```/g, '').replace(/^回复[：:]\s*/, '').replace(/\s+/g, '').trim();
+      if (reply.length > 180) reply = reply.slice(0, 180);
+      if (reply.length < 8) {
+        this.panel.log('模型没有写出可用回复，跳过');
+        this.panel.track({ id: stepId, kind: 'forum', title, status: 'skip', detail: '回复过短' });
+        return true;
+      }
+      await Utils.humanPause(900, 1800);
+      AiWorkspace.setFieldValue(composer, reply);
+      await Utils.humanPause(700, 1400);
+      const sendBtn = AiWorkspace.findForumSendButton(composer);
+      const sendable = sendBtn && !sendBtn.disabled && sendBtn.getAttribute('aria-disabled') !== 'true' && !sendBtn.classList.contains('is-disabled');
+      if (sendable) {
+        await Utils.humanClick(sendBtn, 600, 1400);
+      } else {
+        composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      }
+      const posted = await Utils.poll(() => {
+        const next = AiWorkspace.forumStatus();
+        return next === '已发言' || next === '已完成';
+      }, { interval: 500, timeout: 12000 });
+      if (!posted) {
+        this.panel.log('已尝试发送，页面仍显示未发言');
+        this.panel.track({ id: stepId, kind: 'forum', title, status: 'skip', detail: reply });
+        return true;
+      }
+      this.panel.log(`讨论已发言：${reply.slice(0, 40)}`);
+      this.panel.track({ id: stepId, kind: 'forum', title, status: 'done', detail: reply });
+      await Utils.humanPause(1200, 2200);
+      return true;
+    }
+
     // 直接在ai-workspace页面处理课程的逻辑
     async handleNext(count) {
       if (count >= this.source.length) {
@@ -3176,6 +3368,8 @@ ${questionText}
         ok = await this.handleMedia(route);
       } else if (route.type === 'exercise') {
         ok = await this.handleExercise(route);
+      } else if (route.type === 'forum' || route.type === 'discussion') {
+        ok = await this.handleForum(route);
       } else {
         this.panel.log(`当前类型为 ${route.type}，当前暂不自动处理此类型，自动跳过`);
         await Utils.sleep(2000);

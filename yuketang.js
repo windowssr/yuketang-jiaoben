@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.28
+// @version      3.1.29
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -36,7 +36,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.28',    // 版本号
+    version: '3.1.29',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -1762,6 +1762,28 @@
       ].join(' ');
       return /yiwancheng|is-finish|learned|icon-finish|status-finish/i.test(classText);
     },
+    isLeafMarkedDone(box) {
+      if (!box) return false;
+      const text = (box.innerText || '').replace(/\s+/g, '');
+      if (/未完成|未开始/.test(text)) return false;
+      if (Utils.isMarkedDone(text)) return true;
+      const classText = [
+        box.className || '',
+        ...[...box.querySelectorAll('[class]')].slice(0, 40).map(el => el.className)
+      ].join(' ');
+      return /yiwancheng|is-finish|learned|icon-finish|status-finish/i.test(classText);
+    },
+    isCurrentLessonDone() {
+      if (this.isActiveLessonMarked()) return true;
+      const inOutline = el => Boolean(el.closest('.nav-item-leaf-box, .leaf-item, [class*="catalog"], [class*="catalogue"], [class*="sidebar"], [class*="outline"], [class*="nav-list"]'));
+      return [...document.querySelectorAll('span, div, button, a, p, label')].some(el => {
+        if (!this.isVisibleElement(el) || inOutline(el)) return false;
+        const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!/^已完成(\s*详情)?$/.test(text)) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.top < 280 && rect.height > 0 && rect.height < 56;
+      });
+    },
     getAllScourse() { // 获得ai-workspace的课程列表
       const list = document?.querySelectorAll(".nav-item-leaf-box")
       if (!list) panel.warn("没有发现课程资源")
@@ -3161,6 +3183,14 @@ ${questionText}
     async handleMedia(route) {
       const title = AiWorkspace.getActiveLeafTitle() || `${route.type} ${route.leafId}`;
       const stepId = `ai-${route.leafId || title}`;
+      const alreadyDone = await Utils.poll(() => AiWorkspace.isCurrentLessonDone(), { interval: 200, timeout: 1500 });
+      if (alreadyDone) {
+        const media = AiWorkspace.getMedia();
+        if (media && !media.paused) media.pause();
+        this.panel.log(`${title} 已经完成，跳过`);
+        this.panel.track({ id: stepId, kind: 'video', title, status: 'done', detail: '已完成，跳过' });
+        return true;
+      }
       this.panel.log(`开始播放：${title}`);
       this.panel.track({ id: stepId, kind: 'video', title, status: 'doing' });
       const ready = await Utils.poll(() => {
@@ -3502,6 +3532,12 @@ ${questionText}
 
     // 直接在ai-workspace页面处理课程的逻辑
     async handleNext(count) {
+      while (count < this.source.length && AiWorkspace.isLeafMarkedDone(this.source[count])) {
+        const title = (this.source[count].innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40) || `第 ${count + 1} 项`;
+        this.panel.log(`${title} 已经完成，跳过`);
+        this.panel.track({ id: `ai-leaf-${count}`, kind: 'video', title, status: 'done', detail: '已完成，跳过' });
+        count++;
+      }
       if (count >= this.source.length) {
         this.panel.log('课程刷完啦 🎉');
         this.panel.resetStartButton('刷完啦~');

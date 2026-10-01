@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.26
+// @version      3.1.28
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -36,7 +36,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.26',    // 版本号
+    version: '3.1.28',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -2181,10 +2181,36 @@
         itemBodyElement.querySelector('[class*="answer-list"]') ||
         itemBodyElement.querySelector('ul') ||
         itemBodyElement.querySelector('[role="radiogroup"]');
-      if (!listContainer) return [];
-      const rows = [...listContainer.querySelectorAll('li')].filter(node => node.querySelector('.el-radio, .el-checkbox, input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
-      if (rows.length >= 2) return rows;
-      return [...listContainer.querySelectorAll('.el-radio, .el-checkbox, [role="radio"], [role="checkbox"]')];
+      const listed = (() => {
+        if (!listContainer) return [];
+        const rows = [...listContainer.querySelectorAll('li')].filter(node => node.querySelector('.el-radio, .el-checkbox, input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]'));
+        if (rows.length >= 2) return rows;
+        return [...listContainer.querySelectorAll('.el-radio, .el-checkbox, [role="radio"], [role="checkbox"]')];
+      })();
+      if (listed.length >= 2) return listed;
+      return this.judgeIconChoices(itemBodyElement);
+    },
+    judgeIconChoices(itemBodyElement) {
+      if (!itemBodyElement) return [];
+      const nodes = [...itemBodyElement.querySelectorAll('button, [role="button"], div, span')].filter(el => {
+        if (!AiWorkspace.isVisibleElement(el)) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 24 || rect.width > 72 || rect.height < 24 || rect.height > 72) return false;
+        if (Math.abs(rect.width - rect.height) > 14) return false;
+        const text = (el.innerText || '').replace(/\s+/g, '');
+        if (text.length > 1) return false;
+        const mark = `${el.className || ''} ${el.innerHTML || ''}`;
+        return /check|close|right|wrong|correct|error|tick|cross|judge|icon|svg/i.test(mark) || el.querySelector('svg, i');
+      });
+      nodes.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+      for (let i = 0; i < nodes.length - 1; i++) {
+        const left = nodes[i].getBoundingClientRect();
+        const right = nodes[i + 1].getBoundingClientRect();
+        const sameRow = Math.abs(left.top - right.top) < 16;
+        const near = right.left > left.left && right.left - left.right < 120;
+        if (sameRow && near) return [nodes[i], nodes[i + 1]];
+      }
+      return [];
     },
     detectQuestionType(itemBodyElement) {
       const choices = this.questionChoices(itemBodyElement);
@@ -2195,10 +2221,26 @@
         if (/正确|对|是|True/i.test(text)) return 'true';
         return '';
       };
+      const pageText = `${itemBodyElement?.innerText || ''} ${itemBodyElement?.parentElement?.innerText || ''}`;
+      if (/判断题/.test(pageText.slice(0, 80))) return 'judge';
       const judgeLabels = labels.map(polarity).filter(Boolean);
       if (!hasCheckbox && labels.length === 2 && judgeLabels.length === 2 && judgeLabels[0] !== judgeLabels[1]) return 'judge';
+      if (!hasCheckbox && choices.length === 2 && labels.every(text => text.length <= 1)) return 'judge';
       if (hasCheckbox) return 'multiple';
       return 'single';
+    },
+    revealedResult(element) {
+      const text = String(element?.innerText || '');
+      if (!/本题得分|正确答案/.test(text)) return null;
+      const score = text.match(/本题得分[：:]\s*([0-9.]+)/);
+      const answer = text.match(/正确答案[：:]\s*([^\n]+)/);
+      return {
+        score: score ? score[1] : '',
+        answer: answer ? answer[1].replace(/\s+/g, ' ').trim() : ''
+      };
+    },
+    questionStem(element) {
+      return this.stripReviewNoise(element?.innerText || '').replace(/\s+/g, '').slice(0, 120);
     },
     questionTypeName(questionType) {
       if (questionType === 'multiple') return '多选题';
@@ -2208,7 +2250,7 @@
     questionTypeRule(questionType, optionCount) {
       const maxChar = String.fromCharCode(65 + Math.max(optionCount, 1) - 1);
       const rangeStr = optionCount ? `A-${maxChar}` : 'A-D';
-      if (questionType === 'multiple') return `这是多选题，有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}。选出所有正确答案，字母连写，例如 ABD。`;
+      if (questionType === 'multiple') return `这是多选题，有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}。少选不得分，每个正确选项都要选上，字母连写，例如 ABCD。`;
       if (questionType === 'judge') return '这是判断题。只能输出“对”或“错”，不要输出字母。';
       return `这是单选题，有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}。只能选择一个选项，正确答案只能有一个字母。`;
     },
@@ -2690,6 +2732,16 @@ ${questionText}
       while (i < 40) {
         const items = document.querySelectorAll('.subject-item.J_order');
         const targetEl = document.querySelector('.item-type')?.parentElement || document.querySelector('.item-body');
+        const revealedNow = Solver.revealedResult(targetEl);
+        if (revealedNow) {
+          this.panel.log(`这题得分 ${revealedNow.score || '0'}，正确答案 ${revealedNow.answer || '见页面'}，进入下一题`);
+          const nextItem = items[i + 1];
+          if (!nextItem) break;
+          await Utils.humanClick(nextItem, 1000, 2400);
+          await Utils.humanPause(1200, 2200);
+          i++;
+          continue;
+        }
         const disabled = document.querySelectorAll('.el-button.el-button--info.is-disabled.is-plain');
         if (!targetEl || disabled.length > 0) {
           this.panel.log(`第 ${i + 1} 题已完成，等页面自己进入下一题`);
@@ -2727,13 +2779,35 @@ ${questionText}
               }
               this.panel.log(`当前是${Solver.questionTypeName(questionType)}`);
               const aiText = await Solver.askAI(questionText, optionCount, captured.image, questionType);
-              const before = (targetEl.innerText || '').slice(0, 80);
+              const before = Solver.questionStem(targetEl);
               await Solver.autoSelectAndSubmit(aiText, targetEl, questionType);
               success = true;
+              let shown = null;
+              let jumped = false;
               await Utils.poll(() => {
-                const now = (document.querySelector('.item-body')?.innerText || '').slice(0, 80);
-                return now && now !== before;
-              }, { interval: 500, timeout: 8000 });
+                const body = document.querySelector('.item-body') || targetEl;
+                const stem = Solver.questionStem(body);
+                if (stem && stem !== before) {
+                  jumped = true;
+                  return true;
+                }
+                shown = Solver.revealedResult(body);
+                return Boolean(shown);
+              }, { interval: 400, timeout: 8000 });
+              if (!jumped) {
+                if (shown) {
+                  await Utils.sleep(1200);
+                  const stem = Solver.questionStem(document.querySelector('.item-body') || targetEl);
+                  jumped = Boolean(stem && stem !== before);
+                }
+                if (!jumped) {
+                  const nextItem = items[i + 1];
+                  this.panel.log(shown
+                    ? `这题得分 ${shown.score || '0'}，正确答案 ${shown.answer || '见页面'}，进入下一题`
+                    : '这题没有自动进入下一题，改点下一题号');
+                  if (nextItem) await Utils.humanClick(nextItem, 1000, 2400);
+                }
+              }
             } catch (err) {
               retryCount++;
               this.panel.log(`AI 答题失败：${err}`);
@@ -3243,6 +3317,26 @@ ${questionText}
       return false;
     }
 
+    async openNextExerciseQuestion(root, previousStem = '') {
+      const currentRoot = AiWorkspace.getExerciseContainer() || root;
+      const tabs = AiWorkspace.getExerciseQuestionTabs(currentRoot);
+      const activeIndex = tabs.findIndex(tab => /active|current|selected|is-active/.test(tab.className));
+      const nextTab = activeIndex >= 0 ? tabs[activeIndex + 1] : null;
+      const leftQuestion = () => {
+        const body = AiWorkspace.getExerciseQuestionBody(AiWorkspace.getExerciseContainer() || currentRoot);
+        const stem = Solver.questionStem(body);
+        return Boolean(stem && stem !== previousStem);
+      };
+      if (nextTab) {
+        await Utils.humanClick(nextTab, 800, 1600);
+        if (await Utils.poll(leftQuestion, { interval: 400, timeout: 4000 })) return true;
+      }
+      const nextBtn = AiWorkspace.getExerciseActionButton(AiWorkspace.getExerciseContainer() || currentRoot, /下一题|下一道|下一步/);
+      if (!nextBtn) return false;
+      await Utils.humanClick(nextBtn, 800, 1600);
+      return Utils.poll(leftQuestion, { interval: 400, timeout: 5000 });
+    }
+
     async advanceExerciseQuestion(root, previousFingerprint = '') {
       const currentRoot = AiWorkspace.getExerciseContainer() || root;
       const nextBtn = AiWorkspace.getExerciseActionButton(currentRoot, /下一题|下一道|下一步/);
@@ -3275,25 +3369,46 @@ ${questionText}
       for (let i = 0; i < 40; i++) {
         const currentRoot = AiWorkspace.getExerciseContainer() || root;
         const questionRoot = AiWorkspace.getExerciseQuestionBody(currentRoot);
-        const fingerprint = AiWorkspace.normalizeText(questionRoot?.innerText || '').slice(0, 120);
+        const fingerprint = Solver.questionStem(questionRoot);
         if (!fingerprint) break;
+        const revealed = Solver.revealedResult(questionRoot);
+        if (revealed) {
+          this.panel.log(`这题已显示结果，得分 ${revealed.score || '0'}，正确答案 ${revealed.answer || '见页面'}，进入下一题`);
+          const opened = await this.openNextExerciseQuestion(currentRoot, fingerprint);
+          if (!opened) break;
+          continue;
+        }
         if (AiWorkspace.isExerciseAnswered(questionRoot)) {
-          const tabs = AiWorkspace.getExerciseQuestionTabs(currentRoot);
-          const pending = tabs.find(tab => !/active|current|selected|is-active/.test(tab.className));
-          if (!pending) break;
-          await Utils.humanClick(pending, 800, 1600);
-          await Utils.sleep(1000);
+          const opened = await this.openNextExerciseQuestion(currentRoot, fingerprint);
+          if (!opened) break;
           continue;
         }
         if (i > 0 && fingerprint === previousFingerprint) break;
         await this.solveExerciseQuestion(currentRoot, `第 ${i + 1} 题`);
         previousFingerprint = fingerprint;
-        const moved = await Utils.poll(() => {
+        let shown = null;
+        let jumped = false;
+        await Utils.poll(() => {
           const latestRoot = AiWorkspace.getExerciseQuestionBody(AiWorkspace.getExerciseContainer() || currentRoot);
-          const nextFingerprint = AiWorkspace.normalizeText(latestRoot?.innerText || '').slice(0, 120);
-          return nextFingerprint && nextFingerprint !== fingerprint;
-        }, { interval: 500, timeout: 8000 });
-        if (!moved) break;
+          const stem = Solver.questionStem(latestRoot);
+          if (stem && stem !== fingerprint) {
+            jumped = true;
+            return true;
+          }
+          shown = Solver.revealedResult(latestRoot);
+          return Boolean(shown);
+        }, { interval: 400, timeout: 8000 });
+        if (jumped) continue;
+        if (shown) {
+          await Utils.sleep(1200);
+          const latestRoot = AiWorkspace.getExerciseQuestionBody(AiWorkspace.getExerciseContainer() || currentRoot);
+          if (Solver.questionStem(latestRoot) !== fingerprint) continue;
+          this.panel.log(`这题得分 ${shown.score || '0'}，正确答案 ${shown.answer || '见页面'}，进入下一题`);
+        } else {
+          this.panel.log('这题没有自动进入下一题，改点下一题');
+        }
+        const opened = await this.openNextExerciseQuestion(currentRoot, fingerprint);
+        if (!opened) break;
       }
       return true;
     }

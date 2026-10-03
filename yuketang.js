@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.29
+// @version      3.1.32
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -36,7 +36,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '3.1.29',    // 版本号
+    version: '3.1.32',    // 版本号
     playbackRate: 1,      // 视频播放倍速。高于 1 时，雨课堂会把跳过的区间记成未观看
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -54,10 +54,26 @@
     // 短暂睡眠，等待网页加载
     sleep: (ms = 1000) => new Promise(resolve => setTimeout(resolve, ms)),
     humanPause(min = 900, max = 2400) {
+      if (this.isFastMode()) return this.sleep(0);
       const low = Math.min(min, max);
       const high = Math.max(min, max);
       const ms = low + Math.floor(Math.random() * (high - low + 1));
       return this.sleep(ms);
+    },
+    randInt(min, max) {
+      const low = Math.min(min, max);
+      const high = Math.max(min, max);
+      return low + Math.floor(Math.random() * (high - low + 1));
+    },
+    isTabReallyHidden() {
+      try {
+        const getter = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden')?.get;
+        if (getter) return Boolean(getter.call(document));
+      } catch (_) {}
+      return false;
+    },
+    isFastMode() {
+      return Store.getFeatureConf().fastMode === true;
     },
     isHumanCheckVisible() {
       const pattern = /安全核验|按住.{0,8}起|依次经过|人机|验证码|安全验证|滑动验证|请完成验证|拖动滑块/;
@@ -106,11 +122,23 @@
     async humanClick(element, min = 800, max = 2000) {
       if (!element) return;
       if (!await this.waitIfHumanCheck()) return;
-      try {
-        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      } catch (_) {}
+      if (this.isFastMode()) {
+        try {
+          element.scrollIntoView({ block: 'nearest' });
+        } catch (_) {}
+        element.click();
+        return;
+      }
+      if (Math.random() < 0.75) {
+        try {
+          element.scrollIntoView({ behavior: Math.random() < 0.55 ? 'smooth' : 'auto', block: Math.random() < 0.7 ? 'center' : 'nearest' });
+        } catch (_) {}
+        await this.humanPause(180, 900);
+      }
       await this.humanPause(min, max);
+      if (Math.random() < 0.3) await this.humanPause(350, 1600);
       element.click();
+      if (Math.random() < 0.35) await this.humanPause(220, 900);
     },
     // 将一个 JSON 字符串解析为 JavaScript 对象
     safeJSONParse(value, fallback) {
@@ -131,7 +159,9 @@
         if (checker()) return true;
         const pauseStarted = Date.now();
         await this.sleep(interval);
+        if (this.isTabReallyHidden()) continue;
         const pauseCost = Date.now() - pauseStarted;
+        if (pauseCost > interval * 4) continue;
         spent += (gate === 'waited' ? 0 : gateCost) + pauseCost;
       }
       return false;
@@ -324,6 +354,7 @@
         autoComment: saved.autoComment ?? false,
         answerProvider: saved.answerProvider === 'deepseek' ? 'deepseek' : 'qwen',
         humanCheckMode: saved.humanCheckMode === 'wait' ? 'wait' : 'skip',
+        fastMode: saved.fastMode === true,
       };
       localStorage.setItem(Config.storageKeys.feature, JSON.stringify(conf));
       return conf;
@@ -912,6 +943,12 @@
                       批量区图文和讨论自动回复
                     </label>
                   </div>
+                  <div class="form-item">
+                    <label class="checkbox-label">
+                      <input type="checkbox" id="feature_fast_mode">
+                      快速模式（跳过读题和点击等待）
+                    </label>
+                  </div>
                 </div>
                 <div class="settings-footer">
                   <button id="test_qwen">测试千问</button>
@@ -962,6 +999,7 @@
       authMethodSelect: doc.getElementById('auth_method'),
       featureAutoAI: doc.getElementById('feature_auto_ai'),
       featureAutoComment: doc.getElementById('feature_auto_comment'),
+      featureFastMode: doc.getElementById('feature_fast_mode'),
       minimality: doc.getElementById('minimality'),
       question: doc.getElementById('question'),
       miniBasic: doc.getElementById('mini-basic')
@@ -1156,6 +1194,7 @@
       const saved = Store.getFeatureConf();
       ui.featureAutoAI.checked = saved.autoAI;
       ui.featureAutoComment.checked = saved.autoComment;
+      ui.featureFastMode.checked = saved.fastMode === true;
       const provider = saved.answerProvider === 'deepseek' ? 'deepseek' : 'qwen';
       const picked = doc.querySelector(`input[name="answer_provider"][value="${provider}"]`);
       if (picked) picked.checked = true;
@@ -1234,12 +1273,14 @@
         autoAI: ui.featureAutoAI.checked,
         autoComment: ui.featureAutoComment.checked,
         answerProvider: doc.querySelector('input[name="answer_provider"]:checked')?.value === 'deepseek' ? 'deepseek' : 'qwen',
-        humanCheckMode: doc.querySelector('input[name="human_check_mode"]:checked')?.value === 'wait' ? 'wait' : 'skip'
+        humanCheckMode: doc.querySelector('input[name="human_check_mode"]:checked')?.value === 'wait' ? 'wait' : 'skip',
+        fastMode: ui.featureFastMode.checked
       };
       Store.setFeatureConf(featureConf);
       ui.settings.style.display = 'none';
       const humanText = featureConf.humanCheckMode === 'wait' ? '人机验证改为停住等待' : '人机验证改为跳过当前章节';
-      log(`✅ AI 配置已保存，${humanText}`);
+      const speedText = featureConf.fastMode ? '，已开启快速模式' : '';
+      log(`✅ AI 配置已保存，${humanText}${speedText}`);
     };
 
     ui.btnClear.onclick = () => {
@@ -1791,31 +1832,62 @@
     }
   };
 
-  // 切走页面时，雨课堂会暂停视频。这里拦住切屏事件，让播放继续。
-  function preventScreenCheck() {
-    const win = unsafeWindow;
+  // 切走页面时，雨课堂会暂停视频和作业。这里拦住切屏事件，连作业所在的 iframe 一起拦。
+  function patchScreenCheck(win, doc) {
+    if (!win || !doc || doc._yktScreenCheck) return;
+    doc._yktScreenCheck = true;
     const blackList = new Set(['visibilitychange', 'blur', 'pagehide']);
     if (!win._addEventListener) {
-      win._addEventListener = win.addEventListener;
+      win._addEventListener = win.addEventListener.bind(win);
       win.addEventListener = (...args) => blackList.has(args[0]) ? undefined : win._addEventListener(...args);
     }
-    if (!document._addEventListener) {
-      document._addEventListener = document.addEventListener;
-      document.addEventListener = (...args) => blackList.has(args[0]) ? undefined : document._addEventListener(...args);
+    if (!doc._addEventListener) {
+      doc._addEventListener = doc.addEventListener.bind(doc);
+      doc.addEventListener = (...args) => blackList.has(args[0]) ? undefined : doc._addEventListener(...args);
     }
     try {
-      Object.defineProperties(document, {
-        hidden: { value: false },
-        visibilityState: { value: 'visible' },
-        hasFocus: { value: () => true },
-        onvisibilitychange: { get: () => undefined, set: () => { } },
-        onblur: { get: () => undefined, set: () => { } }
+      Object.defineProperties(doc, {
+        hidden: { configurable: true, get: () => false },
+        visibilityState: { configurable: true, get: () => 'visible' },
+        hasFocus: { configurable: true, value: () => true },
+        onvisibilitychange: { configurable: true, get: () => undefined, set: () => { } },
+        onblur: { configurable: true, get: () => undefined, set: () => { } }
       });
       Object.defineProperties(win, {
-        onblur: { get: () => undefined, set: () => { } },
-        onpagehide: { get: () => undefined, set: () => { } }
+        onblur: { configurable: true, get: () => undefined, set: () => { } },
+        onpagehide: { configurable: true, get: () => undefined, set: () => { } }
       });
     } catch (_) {}
+  }
+
+  function preventScreenCheck() {
+    patchScreenCheck(unsafeWindow, document);
+    const hookFrame = frame => {
+      try {
+        if (!frame?.contentWindow || !frame.contentDocument) return;
+        patchScreenCheck(frame.contentWindow, frame.contentDocument);
+      } catch (_) {}
+    };
+    for (const frame of document.querySelectorAll('iframe')) hookFrame(frame);
+    if (document._yktScreenCheckWatch) return;
+    document._yktScreenCheckWatch = true;
+    const bind = frame => {
+      if (!frame || frame._yktScreenCheckBound) return;
+      frame._yktScreenCheckBound = true;
+      hookFrame(frame);
+      frame.addEventListener('load', () => hookFrame(frame));
+    };
+    for (const frame of document.querySelectorAll('iframe')) bind(frame);
+    new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.tagName === 'IFRAME') bind(node);
+          else if (node.querySelectorAll) {
+            for (const nested of node.querySelectorAll('iframe')) bind(nested);
+          }
+        }
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
   // ---- OCR & AI ----
@@ -2276,6 +2348,15 @@
       if (questionType === 'judge') return '这是判断题。只能输出“对”或“错”，不要输出字母。';
       return `这是单选题，有 ${optionCount || '若干'} 个选项，范围 ${rangeStr}。只能选择一个选项，正确答案只能有一个字母。`;
     },
+    async waitBeforeSearch(prefix) {
+      if (Utils.isFastMode()) {
+        panel.log('快速模式已开启，跳过读题等待');
+        return;
+      }
+      const waitMs = Utils.randInt(5000, 16000);
+      panel.log(`${prefix}，${Math.round(waitMs / 1000)} 秒后开始搜索并提交`);
+      await Utils.sleep(waitMs);
+    },
     async askAI(questionText, optionCount = 0, image = '', questionType = 'single') {
       const answerConf = this.answerConf();
       const modelName = Store.getFeatureConf().answerProvider === 'deepseek' ? 'DeepSeek' : '千问';
@@ -2290,8 +2371,7 @@
         ));
         if (restated.replace(/\s/g, '').length < 8) throw new Error('模型没有复述出题目');
         panel.showQuestion(restated);
-        panel.log('复述已写在上方题目卡片，8 秒后开始搜索并提交');
-        await Utils.sleep(8000);
+        await this.waitBeforeSearch('复述已写在上方题目卡片');
         const evidence = await this.searchQuestion(restated);
         panel.log(evidence ? '正在根据复述和搜索结果作答...' : '没有搜到结果，改由模型根据复述作答...');
         const prompt = `
@@ -2307,8 +2387,7 @@ ${evidence ? `搜索结果：\n${evidence}` : ''}
         return this.requestChat(prompt, '你只输出答案。判断题输出对或错，选择题输出字母。搜索结果只在与本题一致时才采用。', answerConf);
       }
       panel.showQuestion(questionText);
-      panel.log('还原后的题目已写在上方卡片，8 秒后开始搜索并提交');
-      await Utils.sleep(8000);
+      await this.waitBeforeSearch('还原后的题目已写在上方卡片');
       const evidence = await this.searchQuestion(questionText);
       const prompt = `
 你是专业做题助手。先看搜索结果是否就是这道题，再看页面上的选项。
@@ -2373,7 +2452,8 @@ ${questionText}
           choice.querySelector('[role="checkbox"]') ||
           choice.querySelector('input') ||
           choice;
-        await Utils.humanClick(clickable, 900, 2200);
+        await Utils.humanClick(clickable, 1400, 4200);
+        if (targetIndices.length > 1) await Utils.humanPause(500, 2200);
       }
       const submitBtn = (() => {
         const ownerDocument = itemBodyElement.ownerDocument || document;
@@ -2393,7 +2473,8 @@ ${questionText}
       })();
       if (submitBtn) {
         panel.log('正在提交...');
-        await Utils.humanClick(submitBtn, 1400, 3200);
+        await Utils.humanPause(800, 2800);
+        await Utils.humanClick(submitBtn, 1800, 5600);
       } else {
         panel.log('⚠️ 未找到提交按钮，请手动提交');
       }
@@ -2747,6 +2828,7 @@ ${questionText}
         return idx;
       }
       this.panel.log('进入作业，读取题目并请求 AI');
+      if (Utils.isFastMode()) this.panel.log('快速模式已开启，读题和点击不再等待');
       await Utils.humanClick(item, 1200, 2600);
       await Utils.humanPause(1500, 2800);
       let i = 0;
@@ -2800,6 +2882,7 @@ ${questionText}
                 this.panel.log(`🔄 第 ${i + 1} 题重试 ${retryCount}/${maxRetry}...`);
               }
               this.panel.log(`当前是${Solver.questionTypeName(questionType)}`);
+              if (i > 0) await Utils.humanPause(2500, 9000);
               const aiText = await Solver.askAI(questionText, optionCount, captured.image, questionType);
               const before = Solver.questionStem(targetEl);
               await Solver.autoSelectAndSubmit(aiText, targetEl, questionType);
@@ -2834,15 +2917,15 @@ ${questionText}
               retryCount++;
               this.panel.log(`AI 答题失败：${err}`);
               if (retryCount < maxRetry) {
-                this.panel.log(`等待 5 秒后重试...`);
-                await Utils.sleep(5000);
+                this.panel.log(`等待一会儿后重试...`);
+                await Utils.humanPause(4000, 9000);
               } else {
                 this.panel.log(`⚠️ 第 ${i + 1} 题重试 ${maxRetry} 次后仍失败，跳过`);
               }
             }
           }
         }
-        await Utils.humanPause(2500, 5000);
+        await Utils.humanPause(2500, 9000);
         i++;
       }
       idx++;
@@ -3337,11 +3420,11 @@ ${questionText}
           this.panel.log(`当前是${Solver.questionTypeName(questionType)}`);
           const aiText = await Solver.askAI(questionText, optionCount, captured.image, questionType);
           await Solver.autoSelectAndSubmit(aiText, questionRoot, questionType);
-          await Utils.humanPause(2000, 4500);
+          await Utils.humanPause(1800, 8000);
           return true;
         } catch (err) {
           this.panel.log(`AI 答题失败：${err}`);
-          if (retryCount < maxRetry - 1) await Utils.sleep(5000);
+          if (retryCount < maxRetry - 1) await Utils.humanPause(4000, 9000);
         }
       }
       return false;
@@ -3388,6 +3471,7 @@ ${questionText}
       }
 
       const ready = await Utils.poll(() => Boolean(AiWorkspace.getExerciseContainer()), { interval: 500, timeout: 20000 });
+      preventScreenCheck();
       const root = AiWorkspace.getExerciseContainer();
       if (!ready || !root) {
         this.panel.log('未找到作业容器，停止当前轮次');
@@ -3395,6 +3479,7 @@ ${questionText}
       }
 
       this.panel.log(`开始处理作业：${AiWorkspace.getActiveLeafTitle() || route.leafId}`);
+      if (Utils.isFastMode()) this.panel.log('快速模式已开启，读题和点击不再等待');
       let previousFingerprint = '';
       for (let i = 0; i < 40; i++) {
         const currentRoot = AiWorkspace.getExerciseContainer() || root;
@@ -3414,6 +3499,10 @@ ${questionText}
           continue;
         }
         if (i > 0 && fingerprint === previousFingerprint) break;
+        if (i > 0 && !Utils.isFastMode()) {
+          this.panel.log('换题后稍等再答');
+          await Utils.humanPause(2500, 9000);
+        }
         await this.solveExerciseQuestion(currentRoot, `第 ${i + 1} 题`);
         previousFingerprint = fingerprint;
         let shown = null;
